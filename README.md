@@ -20,7 +20,7 @@ opencode installs the package and loads the self-contained ESM bundle (`dist/ind
 
 - **Approval cards** — permission prompts post to Slack as interactive messages with **Approve once / Always / Reject** buttons.
 - **Question cards** — the agent's `question` tool options render as buttons: single-select auto-submits when every question is answered; multi-select uses toggles plus **Submit answers**.
-- **Reply injection** — replying in a session's thread injects the message into the running session as a prompt; `!abort` (or `abort`) stops the session.
+- **Reply injection** — replying in a session's thread answers a pending question first if one exists; otherwise the reply is injected into the running session as a prompt. `!abort` (or `abort`) stops the session.
 - **Status reactions** — the thread root message carries a loader (`:hourglass_flowing_sand:`) while the session works, swapped for a done check mark (`:white_check_mark:`) when it goes idle or is deleted; new activity swaps it back.
 - **`/s` status command** — `/s` replies ephemerally with the target session's title, pending approval/question state, and its last few activity lines, all redacted; `/s <text>` matches a session ID or title.
 - **Redaction** — host-specific detail never reaches Slack: paths, hostnames, usernames, and raw permission metadata are redacted or omitted from cards and summaries.
