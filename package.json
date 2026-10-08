@@ -1,7 +1,8 @@
 {
   "name": "opencode-slack-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bridge opencode agent sessions to Slack: approval/question cards, status reactions, reply injection.",
+  "keywords": ["opencode", "opencode-plugin", "slack", "slack-bridge", "socket-mode"],
   "type": "module",
   "license": "MIT",
   "main": "dist/index.js",
@@ -13,6 +14,15 @@
     }
   },
   "files": ["dist"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/devrkd/mentat.git",
+    "directory": "packages/slack-bridge"
+  },
+  "homepage": "https://github.com/devrkd/mentat/tree/main/packages/slack-bridge",
+  "bugs": {
+    "url": "https://github.com/devrkd/mentat/issues"
+  },
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
