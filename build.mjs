@@ -12,6 +12,9 @@ await build({
   target: "node20",
   outfile: "dist/index.js",
   external: ["node:*"], // node builtins provided by the runtime
+  packages: "external", // deps load via the runtime's resolver: bundling `ws` breaks
+  // the Socket Mode upgrade handshake under opencode's Bun runtime
+  // (`Unexpected server response: 101`) — keep requires native.
   sourcemap: false,
 })
 

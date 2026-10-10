@@ -14,7 +14,7 @@ Add the plugin to your project's `opencode.json`:
 }
 ```
 
-opencode installs the package and loads the self-contained ESM bundle (`dist/index.js`) — nothing else to build or wire up.
+opencode installs the package and loads the ESM bundle (`dist/index.js`). The bundle externalises runtime dependencies (`@slack/*` ships via `dependencies`) — bundling them breaks the Socket Mode WebSocket handshake under opencode's Bun runtime, so `dist/index.js` is not self-contained by design. Nothing else to build or wire up.
 
 ## What you get
 
