@@ -1,6 +1,6 @@
 {
   "name": "opencode-slack-bridge",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Bridge opencode agent sessions to Slack: approval/question cards, status reactions, reply injection.",
   "keywords": [
     "opencode",
