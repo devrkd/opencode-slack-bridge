@@ -64,7 +64,7 @@ npm run build       # esbuild bundle + type declarations into dist/
 npm run typecheck   # tsc --noEmit
 ```
 
-Event-by-event behaviour, the reaction lifecycle, and known limitations are documented in the repo: <https://github.com/devrkd/mentat/blob/main/docs/slack-integration.md>.
+Event-by-event behaviour, the reaction lifecycle, and known limitations are documented in [docs/slack-integration.md](docs/slack-integration.md).
 
 ## License
 

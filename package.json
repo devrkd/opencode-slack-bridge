@@ -24,12 +24,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/devrkd/mentat.git",
-    "directory": "packages/slack-bridge"
+    "url": "git+https://github.com/devrkd/opencode-slack-bridge.git"
   },
-  "homepage": "https://github.com/devrkd/mentat/tree/main/packages/slack-bridge",
+  "homepage": "https://github.com/devrkd/opencode-slack-bridge#readme",
   "bugs": {
-    "url": "https://github.com/devrkd/mentat/issues"
+    "url": "https://github.com/devrkd/opencode-slack-bridge/issues"
   },
   "scripts": {
     "build": "node build.mjs",
