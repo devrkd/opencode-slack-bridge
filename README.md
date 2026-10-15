@@ -2,7 +2,7 @@
 
 Bridge [opencode](https://opencode.ai) agent sessions to Slack: approve permissions and answer questions from Slack, steer long runs from your phone, and watch progress via status reactions — without touching the terminal.
 
-Each session gets one Slack thread, used **only** for the moments a human needs to act. Routine progress (tool runs, plans, completion summaries, errors) is never mirrored, and host-specific detail (absolute paths, hostnames, usernames) is redacted from everything posted. If the Slack config is incomplete the plugin logs once and stays inert, so opencode always starts.
+Each session gets one Slack thread, used **only** for the moments a human needs to act. Routine progress (tool runs, plans, completion summaries, errors) is never mirrored. Credentials are redacted from everything posted; paths and host detail stay readable. Prompts typed in a thread run read-only by default. If the Slack config is incomplete the plugin logs once and stays inert, so opencode always starts.
 
 ## Install
 
@@ -23,7 +23,8 @@ opencode installs the package and loads the ESM bundle (`dist/index.js`). The bu
 - **Reply injection** — replying in a session's thread answers a pending question first if one exists; otherwise the reply is injected into the running session as a prompt and the agent's reply is posted back into the thread (set `SLACK_REPLY_MIRROR=off` to disable). `!abort` (or `abort`) stops the session.
 - **Status reactions** — the thread root message carries a loader (`:hourglass_flowing_sand:`) while the session works, swapped for a done check mark (`:white_check_mark:`) when it goes idle or is deleted; new activity swaps it back.
 - **`/s` status command** — `/s` replies ephemerally with the target session's title, pending approval/question state, and its last few activity lines, all redacted; `/s <text>` matches a session ID or title.
-- **Redaction** — host-specific detail never reaches Slack: paths, hostnames, usernames, and raw permission metadata are redacted or omitted from cards and summaries.
+- **Read-only Slack turns** — prompts typed in a Slack thread run with write access disabled: read-only bash commands (and read-only permission kinds) auto-run, file edits and anything unrecognised are denied and announced in the thread. `SLACK_READ_ONLY=off` restores card-based approvals.
+- **Secret redaction** — credentials never reach Slack: token prefixes (Slack, GitHub, OpenAI/Anthropic, AWS), JWTs, private-key blocks, Authorization headers, credentials in URLs, and `KEY=value` pairs with sensitive keys are redacted. Paths and host detail stay readable so you can follow the work.
 - **Subagent (child) sessions** — child sessions get a thread lazily, only when they first need approval or input; a pointer notice lands in the parent's thread so you can find it.
 
 ## Setup
@@ -54,6 +55,7 @@ SLACK_ALLOWED_USERS=U0123ABCD,U0123ABCDE
 | `SLACK_ALLOWED_USERS` | recommended | Comma-separated Slack user IDs allowed to answer approvals and questions. If empty, any member of the channel can approve agent commands (a warning is logged). |
 | `SLACK_BRIDGE` | no | Set to `off` to disable the bridge without removing tokens (`off`/`false`/`0`/`no` all disable). |
 | `SLACK_REPLY_MIRROR` | no | Set to `off` to stop mirroring the agent's reply back into the thread for Slack-originated prompts (`off`/`false`/`0`/`no` all disable; default on). |
+| `SLACK_READ_ONLY` | no | Set to `off` to disable read-only enforcement for Slack-originated turns and fall back to approval cards for every permission (`off`/`false`/`0`/`no` all disable; default on). |
 
 The session→thread map is persisted in `.opencode/slack-bridge-state.json` under the project directory (not committed). A corrupt state file is discarded and the bridge starts clean.
 

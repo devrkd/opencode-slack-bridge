@@ -19,12 +19,13 @@ export declare function normalizePermission(raw: unknown): PermissionInfo;
 export declare function escapeMrkdwn(text: string): string;
 export declare function truncate(text: string, max?: number): string;
 /**
- * Strips host-specific detail from arbitrary text before it is posted to
- * Slack. Absolute macOS/Linux paths, Windows drive paths, and UNC share
- * paths are replaced with a `[path]` placeholder so no hostnames,
- * usernames, or local directory structure leak into the channel.
+ * Scrubs credentials and secrets from arbitrary text before it is posted
+ * to Slack: token prefixes (Slack, GitHub, OpenAI/Anthropic, AWS), JWTs,
+ * private-key blocks, Authorization headers, credentials in URLs, and
+ * `KEY=value` pairs whose key looks sensitive. Everything else — including
+ * absolute paths — passes through unchanged so agent output stays readable.
  */
-export declare function redactHostInfo(text: string): string;
+export declare function redactSecrets(text: string): string;
 /**
  * Project name for a working directory, without any host detail. Returns
  * the directory's basename — the repo/project the agent is working on —

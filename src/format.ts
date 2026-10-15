@@ -60,19 +60,45 @@ export function truncate(text: string, max = 280): string {
 }
 
 /**
- * Strips host-specific detail from arbitrary text before it is posted to
- * Slack. Absolute macOS/Linux paths, Windows drive paths, and UNC share
- * paths are replaced with a `[path]` placeholder so no hostnames,
- * usernames, or local directory structure leak into the channel.
+ * Credential/secret patterns scrubbed from everything posted to Slack, in
+ * application order. Paths and other host detail are deliberately NOT
+ * redacted — agent output stays readable — but anything that authenticates
+ * is replaced with a placeholder.
  */
-export function redactHostInfo(text: string): string {
-  const unixAbsolute = /(?<![\w./~-])\/(?:Users|home|root|private|var|tmp|etc|opt|usr|Volumes)\/[^\s"'`()<>[\]{}|;,]*/g
-  const windowsDrive = /\b[A-Za-z]:\\[^\s"'`()<>[\]{}|;,]*/g
-  const uncShare = /\\\\[^\\\s]+\\[^\s"'`()<>[\]{}|;,]*/g
-  return (text ?? "")
-    .replace(unixAbsolute, "[path]")
-    .replace(windowsDrive, "[path]")
-    .replace(uncShare, "[path]")
+const SECRET_RULES: Array<{ pattern: RegExp; replacement: string }> = [
+  // PEM private-key blocks (multi-line).
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[redacted private key]" },
+  // Credentials inside URLs: scheme://user:password@host
+  { pattern: /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s:@/]+):([^\s@/]+)@/g, replacement: "$1[redacted]@" },
+  // Authorization headers.
+  { pattern: /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replacement: "$1 [redacted]" },
+  // Well-known token prefixes: Slack, GitHub, OpenAI/Anthropic, AWS, JWT.
+  { pattern: /\b(?:xox[abprs]|xapp)-[A-Za-z0-9-]{10,}/g, replacement: "[redacted]" },
+  { pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}/g, replacement: "[redacted]" },
+  { pattern: /\bgithub_pat_[A-Za-z0-9_]{16,}/g, replacement: "[redacted]" },
+  { pattern: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}/g, replacement: "[redacted]" },
+  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: "[redacted]" },
+  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: "[redacted]" },
+  // KEY=value / KEY: value pairs whose key looks sensitive.
+  {
+    pattern: /\b((?:api[_-]?key|apikey|access[_-]?key|secret|token|password|passwd|pwd|authorization|credentials?|private[_-]?key)[\s"']*[:=][\s"']*)([^\s"',;&)]+)/gi,
+    replacement: "$1[redacted]",
+  },
+]
+
+/**
+ * Scrubs credentials and secrets from arbitrary text before it is posted
+ * to Slack: token prefixes (Slack, GitHub, OpenAI/Anthropic, AWS), JWTs,
+ * private-key blocks, Authorization headers, credentials in URLs, and
+ * `KEY=value` pairs whose key looks sensitive. Everything else — including
+ * absolute paths — passes through unchanged so agent output stays readable.
+ */
+export function redactSecrets(text: string): string {
+  let out = (text ?? "")
+  for (const rule of SECRET_RULES) {
+    out = out.replace(rule.pattern, rule.replacement)
+  }
+  return out
 }
 
 /**
@@ -88,7 +114,7 @@ export function projectName(directory?: string): string {
 }
 
 export function sessionRootText(title: string, directory?: string): string {
-  const name = escapeMrkdwn(truncate(redactHostInfo(title) || "untitled session", 120))
+  const name = escapeMrkdwn(truncate(redactSecrets(title) || "untitled session", 120))
   const project = projectName(directory)
   const where = project ? `\n_Project: ${escapeMrkdwn(project)}_` : ""
   return `*Session started* — ${name}${where}\nApprovals and replies stay in this thread.`
@@ -96,16 +122,16 @@ export function sessionRootText(title: string, directory?: string): string {
 
 /** Root message for a child (subagent) session thread, created lazily. */
 export function childSessionRootText(title: string, parentTitle?: string): string {
-  const name = escapeMrkdwn(truncate(redactHostInfo(title) || "untitled subagent", 120))
+  const name = escapeMrkdwn(truncate(redactSecrets(title) || "untitled subagent", 120))
   const parent = parentTitle
-    ? ` _(child of ${escapeMrkdwn(truncate(redactHostInfo(parentTitle), 80))})_`
+    ? ` _(child of ${escapeMrkdwn(truncate(redactSecrets(parentTitle), 80))})_`
     : ""
   return `*Subagent session* — ${name}${parent}\nApprovals and replies for this subagent stay in this thread.`
 }
 
 /** One-line notice dropped into the parent thread when a child thread is created. */
 export function childThreadPointerText(childTitle: string): string {
-  return `🛑 Subagent _${escapeMrkdwn(truncate(redactHostInfo(childTitle), 80))}_ is requesting approval — see its thread below.`
+  return `🛑 Subagent _${escapeMrkdwn(truncate(redactSecrets(childTitle), 80))}_ is requesting approval — see its thread below.`
 }
 
 /**
@@ -122,7 +148,7 @@ export function recentContextLines(text: string, maxLines = 3, maxChars = 160): 
     .filter((line) => line.length > 0)
   return lines
     .slice(-maxLines)
-    .map((line) => redactHostInfo(truncate(line, maxChars)))
+    .map((line) => redactSecrets(truncate(line, maxChars)))
     .join("\n")
 }
 
@@ -142,7 +168,7 @@ export function sessionStatusText(
   pending: { approval: boolean; question: boolean },
   activity: StatusActivity[],
 ): string {
-  const name = escapeMrkdwn(truncate(redactHostInfo(title) || "untitled session", 120))
+  const name = escapeMrkdwn(truncate(redactSecrets(title) || "untitled session", 120))
   const parts = [`*Session status* — ${name}`]
   if (pending.approval) parts.push("⏳ _Awaiting approval._")
   if (pending.question) parts.push("❓ _Question pending._")
@@ -165,16 +191,16 @@ function permissionDetails(permission: PermissionInfo): string[] {
   const details: string[] = []
   const command = permission.metadata.command
   if (typeof command === "string" && command.trim()) {
-    details.push(`command: \`${escapeMrkdwn(truncate(redactHostInfo(command), 300))}\``)
+    details.push(`command: \`${escapeMrkdwn(truncate(redactSecrets(command), 300))}\``)
   }
   if (permission.always.length > 0) {
-    details.push(`always: \`${escapeMrkdwn(truncate(redactHostInfo(permission.always.join(", ")), 200))}\``)
+    details.push(`always: \`${escapeMrkdwn(truncate(redactSecrets(permission.always.join(", ")), 200))}\``)
   }
   return details
 }
 
 export function permissionText(permission: PermissionInfo): string {
-  return `Approval needed: ${escapeMrkdwn(truncate(redactHostInfo(permission.title), 250))}`
+  return `Approval needed: ${escapeMrkdwn(truncate(redactSecrets(permission.title), 250))}`
 }
 
 export type PermissionAction = "once" | "always" | "reject"
@@ -186,10 +212,10 @@ export function permissionBlocks(
   valueFor: (action: PermissionAction) => string,
   context?: string,
 ): SlackBlock[] {
-  const title = escapeMrkdwn(truncate(redactHostInfo(permission.title || "action requires approval"), 250))
+  const title = escapeMrkdwn(truncate(redactSecrets(permission.title || "action requires approval"), 250))
   const details = permissionDetails(permission)
   const contextParts = [
-    `session: _${escapeMrkdwn(truncate(redactHostInfo(sessionTitle), 80))}_`,
+    `session: _${escapeMrkdwn(truncate(redactSecrets(sessionTitle), 80))}_`,
     `type: \`${escapeMrkdwn(permission.kind)}\``,
   ]
   if (details.length > 0) contextParts.push(details.join("  ·  "))
@@ -207,7 +233,7 @@ export function permissionBlocks(
   if (context) {
     blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text: `*Recent context*\n${escapeMrkdwn(truncate(redactHostInfo(context), 600))}` },
+      text: { type: "mrkdwn", text: `*Recent context*\n${escapeMrkdwn(truncate(redactSecrets(context), 600))}` },
     })
   }
   blocks.push({
@@ -261,7 +287,7 @@ const MIRROR_MAX_CHARS = 2900
 
 /** Short notification text for a mirrored agent reply. */
 export function agentReplyText(text: string): string {
-  return truncate(redactHostInfo((text ?? "").trim()), 120)
+  return truncate(redactSecrets((text ?? "").trim()), 120)
 }
 
 /**
@@ -271,7 +297,7 @@ export function agentReplyText(text: string): string {
  */
 export function agentReplyBlocks(text: string): SlackBlock[] {
   const raw = (text ?? "").trim()
-  const body = truncate(redactHostInfo(raw), MIRROR_MAX_CHARS)
+  const body = truncate(redactSecrets(raw), MIRROR_MAX_CHARS)
   const suffix = raw.length > body.length ? "\n\n_(truncated)_" : ""
   return [
     {
@@ -325,7 +351,7 @@ export function normalizeQuestion(raw: unknown): QuestionRequestInfo {
 
 export function questionText(info: QuestionRequestInfo): string {
   const header = info.questions[0]?.header ?? "the agent has a question"
-  return `Input needed: ${escapeMrkdwn(truncate(redactHostInfo(header), 120))}`
+  return `Input needed: ${escapeMrkdwn(truncate(redactSecrets(header), 120))}`
 }
 
 export function questionBlocks(
@@ -341,7 +367,7 @@ export function questionBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Input needed* — _${escapeMrkdwn(truncate(redactHostInfo(sessionTitle), 80))}_`,
+        text: `*Input needed* — _${escapeMrkdwn(truncate(redactSecrets(sessionTitle), 80))}_`,
       },
     },
   ]
@@ -349,14 +375,14 @@ export function questionBlocks(
   if (context) {
     blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text: `*Recent context*\n${escapeMrkdwn(truncate(redactHostInfo(context), 600))}` },
+      text: { type: "mrkdwn", text: `*Recent context*\n${escapeMrkdwn(truncate(redactSecrets(context), 600))}` },
     })
   }
 
   info.questions.forEach((question, index) => {
     const chosen = selected[index] ?? []
-    const header = `*Q${index + 1}. ${escapeMrkdwn(truncate(redactHostInfo(question.header), 60))}*`
-    const body = escapeMrkdwn(truncate(redactHostInfo(question.question), 500))
+    const header = `*Q${index + 1}. ${escapeMrkdwn(truncate(redactSecrets(question.header), 60))}*`
+    const body = escapeMrkdwn(truncate(redactSecrets(question.question), 500))
     const hints: string[] = []
     if (question.multiple) hints.push("_Select one or more, then Submit._")
     if (question.custom) hints.push("_Or reply in the thread with your own answer._")
@@ -368,7 +394,7 @@ export function questionBlocks(
         const button: Record<string, unknown> = {
           type: "button",
           action_id: `${actionPrefix}:qopt:${index}:${optionIndex}`,
-          text: { type: "plain_text", text: truncate(redactHostInfo(option.label || option.description), 75) },
+          text: { type: "plain_text", text: truncate(redactSecrets(option.label || option.description), 75) },
           value: JSON.stringify({
             kind: "qopt",
             requestID: info.id,

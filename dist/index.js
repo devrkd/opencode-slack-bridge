@@ -66,7 +66,14 @@ function loadConfig(directory) {
   }
   return {
     ok: true,
-    config: { botToken, appToken, channel, allowedUsers, mirrorReplies: !isOff(process.env.SLACK_REPLY_MIRROR) }
+    config: {
+      botToken,
+      appToken,
+      channel,
+      allowedUsers,
+      mirrorReplies: !isOff(process.env.SLACK_REPLY_MIRROR),
+      readOnlyTurns: !isOff(process.env.SLACK_READ_ONLY)
+    }
   };
 }
 
@@ -126,6 +133,102 @@ var SessionMap = class {
   }
 };
 
+// src/read-only.ts
+var READ_ONLY_COMMANDS = /* @__PURE__ */ new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "grep",
+  "rg",
+  "pwd",
+  "wc",
+  "which",
+  "file",
+  "stat",
+  "du",
+  "df",
+  "tree",
+  "diff",
+  "sort",
+  "uniq",
+  "comm",
+  "cmp",
+  "date",
+  "uname",
+  "whoami",
+  "id",
+  "tty",
+  "basename",
+  "dirname",
+  "realpath",
+  "readlink",
+  "jq",
+  "md5",
+  "md5sum",
+  "shasum",
+  "sha256sum",
+  "cksum",
+  "echo",
+  "true",
+  "false",
+  "test"
+]);
+var GIT_READ_ONLY_SUBCOMMANDS = /* @__PURE__ */ new Set([
+  "status",
+  "log",
+  "diff",
+  "show",
+  "blame",
+  "shortlog",
+  "describe",
+  "rev-parse",
+  "ls-files",
+  "ls-remote",
+  "grep"
+]);
+var FIND_WRITE_FLAGS = /* @__PURE__ */ new Set([
+  "-delete",
+  "-exec",
+  "-execdir",
+  "-ok",
+  "-okdir",
+  "-fprint",
+  "-fprint0",
+  "-fprintf"
+]);
+var UNSAFE_SEGMENT = /[<>]|\$\(|\$\{|`|&\s*$/;
+function isReadOnlySegment(segment) {
+  let tokens = segment.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  while (tokens.length > 1 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
+    tokens = tokens.slice(1);
+  }
+  const [cmd, ...args] = tokens;
+  if (cmd === "git") {
+    if (args.length === 0) return true;
+    const sub = args[0];
+    if (sub === "worktree" || sub === "stash") return args[1] === "list";
+    return GIT_READ_ONLY_SUBCOMMANDS.has(sub);
+  }
+  if (cmd === "find") {
+    return !args.some((arg) => FIND_WRITE_FLAGS.has(arg));
+  }
+  return READ_ONLY_COMMANDS.has(cmd);
+}
+function isReadOnlyBashCommand(command) {
+  const clean = (command ?? "").trim();
+  if (!clean) return false;
+  const segments = clean.split(/\|\||&&|;|\|/);
+  if (segments.length === 0) return false;
+  return segments.every((segment) => {
+    const s = segment.trim();
+    if (!s) return false;
+    if (UNSAFE_SEGMENT.test(s)) return false;
+    return isReadOnlySegment(s);
+  });
+}
+
 // src/format.ts
 import { basename } from "node:path";
 import { homedir } from "node:os";
@@ -155,11 +258,32 @@ function truncate(text, max = 280) {
   if (clean.length <= max) return clean;
   return `${clean.slice(0, max - 1).trimEnd()}\u2026`;
 }
-function redactHostInfo(text) {
-  const unixAbsolute = /(?<![\w./~-])\/(?:Users|home|root|private|var|tmp|etc|opt|usr|Volumes)\/[^\s"'`()<>[\]{}|;,]*/g;
-  const windowsDrive = /\b[A-Za-z]:\\[^\s"'`()<>[\]{}|;,]*/g;
-  const uncShare = /\\\\[^\\\s]+\\[^\s"'`()<>[\]{}|;,]*/g;
-  return (text ?? "").replace(unixAbsolute, "[path]").replace(windowsDrive, "[path]").replace(uncShare, "[path]");
+var SECRET_RULES = [
+  // PEM private-key blocks (multi-line).
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[redacted private key]" },
+  // Credentials inside URLs: scheme://user:password@host
+  { pattern: /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s:@/]+):([^\s@/]+)@/g, replacement: "$1[redacted]@" },
+  // Authorization headers.
+  { pattern: /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replacement: "$1 [redacted]" },
+  // Well-known token prefixes: Slack, GitHub, OpenAI/Anthropic, AWS, JWT.
+  { pattern: /\b(?:xox[abprs]|xapp)-[A-Za-z0-9-]{10,}/g, replacement: "[redacted]" },
+  { pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}/g, replacement: "[redacted]" },
+  { pattern: /\bgithub_pat_[A-Za-z0-9_]{16,}/g, replacement: "[redacted]" },
+  { pattern: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}/g, replacement: "[redacted]" },
+  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: "[redacted]" },
+  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: "[redacted]" },
+  // KEY=value / KEY: value pairs whose key looks sensitive.
+  {
+    pattern: /\b((?:api[_-]?key|apikey|access[_-]?key|secret|token|password|passwd|pwd|authorization|credentials?|private[_-]?key)[\s"']*[:=][\s"']*)([^\s"',;&)]+)/gi,
+    replacement: "$1[redacted]"
+  }
+];
+function redactSecrets(text) {
+  let out = text ?? "";
+  for (const rule of SECRET_RULES) {
+    out = out.replace(rule.pattern, rule.replacement);
+  }
+  return out;
 }
 function projectName(directory) {
   const dir = (directory ?? "").trim();
@@ -167,7 +291,7 @@ function projectName(directory) {
   return basename(dir);
 }
 function sessionRootText(title, directory) {
-  const name = escapeMrkdwn(truncate(redactHostInfo(title) || "untitled session", 120));
+  const name = escapeMrkdwn(truncate(redactSecrets(title) || "untitled session", 120));
   const project = projectName(directory);
   const where = project ? `
 _Project: ${escapeMrkdwn(project)}_` : "";
@@ -175,22 +299,22 @@ _Project: ${escapeMrkdwn(project)}_` : "";
 Approvals and replies stay in this thread.`;
 }
 function childSessionRootText(title, parentTitle) {
-  const name = escapeMrkdwn(truncate(redactHostInfo(title) || "untitled subagent", 120));
-  const parent = parentTitle ? ` _(child of ${escapeMrkdwn(truncate(redactHostInfo(parentTitle), 80))})_` : "";
+  const name = escapeMrkdwn(truncate(redactSecrets(title) || "untitled subagent", 120));
+  const parent = parentTitle ? ` _(child of ${escapeMrkdwn(truncate(redactSecrets(parentTitle), 80))})_` : "";
   return `*Subagent session* \u2014 ${name}${parent}
 Approvals and replies for this subagent stay in this thread.`;
 }
 function childThreadPointerText(childTitle) {
-  return `\u{1F6D1} Subagent _${escapeMrkdwn(truncate(redactHostInfo(childTitle), 80))}_ is requesting approval \u2014 see its thread below.`;
+  return `\u{1F6D1} Subagent _${escapeMrkdwn(truncate(redactSecrets(childTitle), 80))}_ is requesting approval \u2014 see its thread below.`;
 }
 function recentContextLines(text, maxLines = 3, maxChars = 160) {
   const clean = (text ?? "").trim();
   if (!clean) return "";
   const lines = clean.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
-  return lines.slice(-maxLines).map((line) => redactHostInfo(truncate(line, maxChars))).join("\n");
+  return lines.slice(-maxLines).map((line) => redactSecrets(truncate(line, maxChars))).join("\n");
 }
 function sessionStatusText(title, pending, activity) {
-  const name = escapeMrkdwn(truncate(redactHostInfo(title) || "untitled session", 120));
+  const name = escapeMrkdwn(truncate(redactSecrets(title) || "untitled session", 120));
   const parts = [`*Session status* \u2014 ${name}`];
   if (pending.approval) parts.push("\u23F3 _Awaiting approval._");
   if (pending.question) parts.push("\u2753 _Question pending._");
@@ -207,21 +331,21 @@ function permissionDetails(permission) {
   const details = [];
   const command = permission.metadata.command;
   if (typeof command === "string" && command.trim()) {
-    details.push(`command: \`${escapeMrkdwn(truncate(redactHostInfo(command), 300))}\``);
+    details.push(`command: \`${escapeMrkdwn(truncate(redactSecrets(command), 300))}\``);
   }
   if (permission.always.length > 0) {
-    details.push(`always: \`${escapeMrkdwn(truncate(redactHostInfo(permission.always.join(", ")), 200))}\``);
+    details.push(`always: \`${escapeMrkdwn(truncate(redactSecrets(permission.always.join(", ")), 200))}\``);
   }
   return details;
 }
 function permissionText(permission) {
-  return `Approval needed: ${escapeMrkdwn(truncate(redactHostInfo(permission.title), 250))}`;
+  return `Approval needed: ${escapeMrkdwn(truncate(redactSecrets(permission.title), 250))}`;
 }
 function permissionBlocks(permission, sessionTitle, actionPrefix, valueFor, context) {
-  const title = escapeMrkdwn(truncate(redactHostInfo(permission.title || "action requires approval"), 250));
+  const title = escapeMrkdwn(truncate(redactSecrets(permission.title || "action requires approval"), 250));
   const details = permissionDetails(permission);
   const contextParts = [
-    `session: _${escapeMrkdwn(truncate(redactHostInfo(sessionTitle), 80))}_`,
+    `session: _${escapeMrkdwn(truncate(redactSecrets(sessionTitle), 80))}_`,
     `type: \`${escapeMrkdwn(permission.kind)}\``
   ];
   if (details.length > 0) contextParts.push(details.join("  \xB7  "));
@@ -240,7 +364,7 @@ ${title}` }
     blocks.push({
       type: "section",
       text: { type: "mrkdwn", text: `*Recent context*
-${escapeMrkdwn(truncate(redactHostInfo(context), 600))}` }
+${escapeMrkdwn(truncate(redactSecrets(context), 600))}` }
     });
   }
   blocks.push({
@@ -289,11 +413,11 @@ function resolvedBlocks(label) {
 }
 var MIRROR_MAX_CHARS = 2900;
 function agentReplyText(text) {
-  return truncate(redactHostInfo((text ?? "").trim()), 120);
+  return truncate(redactSecrets((text ?? "").trim()), 120);
 }
 function agentReplyBlocks(text) {
   const raw = (text ?? "").trim();
-  const body = truncate(redactHostInfo(raw), MIRROR_MAX_CHARS);
+  const body = truncate(redactSecrets(raw), MIRROR_MAX_CHARS);
   const suffix = raw.length > body.length ? "\n\n_(truncated)_" : "";
   return [
     {
@@ -326,7 +450,7 @@ function normalizeQuestion(raw) {
 }
 function questionText(info) {
   const header = info.questions[0]?.header ?? "the agent has a question";
-  return `Input needed: ${escapeMrkdwn(truncate(redactHostInfo(header), 120))}`;
+  return `Input needed: ${escapeMrkdwn(truncate(redactSecrets(header), 120))}`;
 }
 function questionBlocks(info, sessionTitle, actionPrefix, selected, notice, context) {
   const blocks = [
@@ -334,7 +458,7 @@ function questionBlocks(info, sessionTitle, actionPrefix, selected, notice, cont
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Input needed* \u2014 _${escapeMrkdwn(truncate(redactHostInfo(sessionTitle), 80))}_`
+        text: `*Input needed* \u2014 _${escapeMrkdwn(truncate(redactSecrets(sessionTitle), 80))}_`
       }
     }
   ];
@@ -342,13 +466,13 @@ function questionBlocks(info, sessionTitle, actionPrefix, selected, notice, cont
     blocks.push({
       type: "section",
       text: { type: "mrkdwn", text: `*Recent context*
-${escapeMrkdwn(truncate(redactHostInfo(context), 600))}` }
+${escapeMrkdwn(truncate(redactSecrets(context), 600))}` }
     });
   }
   info.questions.forEach((question, index) => {
     const chosen = selected[index] ?? [];
-    const header = `*Q${index + 1}. ${escapeMrkdwn(truncate(redactHostInfo(question.header), 60))}*`;
-    const body = escapeMrkdwn(truncate(redactHostInfo(question.question), 500));
+    const header = `*Q${index + 1}. ${escapeMrkdwn(truncate(redactSecrets(question.header), 60))}*`;
+    const body = escapeMrkdwn(truncate(redactSecrets(question.question), 500));
     const hints = [];
     if (question.multiple) hints.push("_Select one or more, then Submit._");
     if (question.custom) hints.push("_Or reply in the thread with your own answer._");
@@ -361,7 +485,7 @@ ${body}${hint}` } });
         const button = {
           type: "button",
           action_id: `${actionPrefix}:qopt:${index}:${optionIndex}`,
-          text: { type: "plain_text", text: truncate(redactHostInfo(option.label || option.description), 75) },
+          text: { type: "plain_text", text: truncate(redactSecrets(option.label || option.description), 75) },
           value: JSON.stringify({
             kind: "qopt",
             requestID: info.id,
@@ -612,6 +736,64 @@ async function createBridge(input) {
       permissionID: permission.id,
       response: action
     });
+  }
+  const READ_ONLY_PERMISSION_KINDS = /* @__PURE__ */ new Set(["read", "glob", "grep", "list", "task", "webfetch"]);
+  function classifyReadOnlyPermission(permission) {
+    if (permission.kind === "bash") {
+      const command = typeof permission.metadata.command === "string" ? permission.metadata.command : void 0;
+      if (command && isReadOnlyBashCommand(command)) return { allow: true, reason: "read-only command" };
+      return { allow: false, reason: "command is not recognisably read-only" };
+    }
+    if (READ_ONLY_PERMISSION_KINDS.has(permission.kind)) {
+      return { allow: true, reason: "read-only permission kind" };
+    }
+    return { allow: false, reason: `unsupported permission kind (${permission.kind})` };
+  }
+  function isReadOnlySession(sessionID) {
+    let current = sessionID;
+    while (current) {
+      if (mirroring.has(current)) return true;
+      current = sessions.get(current)?.parentID;
+    }
+    return false;
+  }
+  async function autoRespondPermission(permission, allow, reason) {
+    if (!permission.id || !permission.sessionID) return;
+    let submitted = false;
+    try {
+      const result2 = await client.postSessionIdPermissionsPermissionId({
+        path: { id: permission.sessionID, permissionID: permission.id },
+        body: { response: allow ? "once" : "reject" }
+      });
+      submitted = !result2.error;
+      if (result2.error) {
+        await log("warn", "read-only auto-response failed", {
+          permissionID: permission.id,
+          status: result2.response.status,
+          error: describeError(result2.error)
+        });
+      }
+    } catch (error) {
+      await log("warn", "read-only auto-response failed", {
+        permissionID: permission.id,
+        error: describeError(error)
+      });
+    }
+    if (!submitted) return;
+    await log(allow ? "info" : "warn", allow ? "read-only turn: auto-approved" : "read-only turn: denied", {
+      permissionID: permission.id,
+      sessionID: permission.sessionID,
+      kind: permission.kind,
+      reason
+    });
+    if (allow) return;
+    const ref = sessions.get(permission.sessionID);
+    if (ref) {
+      await postThread(
+        ref,
+        `\u270B _Read-only from Slack \u2014 denied: ${escapeMrkdwn(truncate(redactSecrets(permission.title), 120))}_`
+      );
+    }
   }
   function describeError(error) {
     if (error instanceof Error) return error.message;
@@ -921,9 +1103,20 @@ async function createBridge(input) {
       case "todo.updated": {
         return;
       }
-      case "permission.asked":
+      case "permission.asked": {
+        const permission = normalizePermission(event.properties);
+        if (config.readOnlyTurns && isReadOnlySession(permission.sessionID)) {
+          const verdict = classifyReadOnlyPermission(permission);
+          await autoRespondPermission(permission, verdict.allow, verdict.reason);
+          return;
+        }
+        await onPermission(permission);
+        return;
+      }
       case "permission.updated": {
-        await onPermission(normalizePermission(event.properties));
+        const permission = normalizePermission(event.properties);
+        if (config.readOnlyTurns && isReadOnlySession(permission.sessionID)) return;
+        await onPermission(permission);
         return;
       }
       case "permission.replied": {
@@ -1209,7 +1402,7 @@ async function createBridge(input) {
       if (latest) [targetID, ref] = latest;
     }
     if (!targetID || !ref) {
-      const hint = query ? `No session matching \`${escapeMrkdwn(truncate(redactHostInfo(query), 60))}\` found.` : "No sessions in this channel yet.";
+      const hint = query ? `No session matching \`${escapeMrkdwn(truncate(redactSecrets(query), 60))}\` found.` : "No sessions in this channel yet.";
       await replyEphemeral(channelID, userID, hint);
       return;
     }

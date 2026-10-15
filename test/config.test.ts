@@ -5,7 +5,15 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { loadConfig, loadDotenv } from "../src/config"
 
-const SLACK_KEYS = ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_CHANNEL", "SLACK_ALLOWED_USERS", "SLACK_BRIDGE"]
+const SLACK_KEYS = [
+  "SLACK_BOT_TOKEN",
+  "SLACK_APP_TOKEN",
+  "SLACK_CHANNEL",
+  "SLACK_ALLOWED_USERS",
+  "SLACK_BRIDGE",
+  "SLACK_REPLY_MIRROR",
+  "SLACK_READ_ONLY",
+]
 
 function withEnv(env: Record<string, string | undefined>, fn: () => void): void {
   const saved = new Map(SLACK_KEYS.map((key) => [key, process.env[key]]))
@@ -141,6 +149,28 @@ describe("config: loadConfig", () => {
       const result = loadConfig(dir)
       assert.equal(result.ok, true)
       if (result.ok) assert.deepEqual(result.config.allowedUsers, [])
+    })
+  })
+
+  it("defaults reply mirroring and read-only turns to on", () => {
+    withEnv(valid, () => {
+      const result = loadConfig(dir)
+      assert.equal(result.ok, true)
+      if (result.ok) {
+        assert.equal(result.config.mirrorReplies, true)
+        assert.equal(result.config.readOnlyTurns, true)
+      }
+    })
+  })
+
+  it("honours SLACK_REPLY_MIRROR / SLACK_READ_ONLY off spellings", () => {
+    withEnv({ ...valid, SLACK_REPLY_MIRROR: "off", SLACK_READ_ONLY: "No" }, () => {
+      const result = loadConfig(dir)
+      assert.equal(result.ok, true)
+      if (result.ok) {
+        assert.equal(result.config.mirrorReplies, false)
+        assert.equal(result.config.readOnlyTurns, false)
+      }
     })
   })
 })

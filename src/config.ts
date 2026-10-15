@@ -8,6 +8,8 @@ export type BridgeConfig = {
   allowedUsers: string[]
   /** Mirror the agent's reply back into the thread for Slack-originated prompts. */
   mirrorReplies: boolean
+  /** Enforce read-only execution for Slack-originated turns (auto-respond to permissions). */
+  readOnlyTurns: boolean
 }
 
 export type ConfigResult =
@@ -91,6 +93,13 @@ export function loadConfig(directory: string): ConfigResult {
 
   return {
     ok: true,
-    config: { botToken, appToken, channel, allowedUsers, mirrorReplies: !isOff(process.env.SLACK_REPLY_MIRROR) },
+    config: {
+      botToken,
+      appToken,
+      channel,
+      allowedUsers,
+      mirrorReplies: !isOff(process.env.SLACK_REPLY_MIRROR),
+      readOnlyTurns: !isOff(process.env.SLACK_READ_ONLY),
+    },
   }
 }

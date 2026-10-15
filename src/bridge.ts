@@ -5,6 +5,7 @@ import type { PluginInput } from "@opencode-ai/plugin"
 import type { Session } from "@opencode-ai/sdk"
 import { loadConfig } from "./config"
 import { SessionMap, type SessionRef } from "./session-map"
+import { isReadOnlyBashCommand } from "./read-only"
 import {
   agentReplyBlocks,
   agentReplyText,
@@ -18,7 +19,7 @@ import {
   questionBlocks,
   questionText,
   recentContextLines,
-  redactHostInfo,
+  redactSecrets,
   resolvedBlocks,
   sessionRootText,
   sessionStatusText,
@@ -84,7 +85,9 @@ type PendingQuestion = {
  * In-flight reply mirroring for a session whose turn was started from a
  * Slack thread reply: tracks which text parts were already posted so
  * streaming re-emits are not duplicated, and whether anything was posted
- * at all (drives the session.idle fallback).
+ * at all (drives the session.idle fallback). While an entry exists the
+ * session (and any subagent it spawns) is also constrained to read-only
+ * execution when `SLACK_READ_ONLY` is on.
  */
 type MirrorState = {
   postedParts: Set<string>
@@ -374,6 +377,86 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
       permissionID: permission.id,
       response: action,
     })
+  }
+
+  /** Permission kinds that never mutate anything; anything unlisted is denied. */
+  const READ_ONLY_PERMISSION_KINDS = new Set(["read", "glob", "grep", "list", "task", "webfetch"])
+
+  /** Verdict for a permission request inside a Slack-originated (read-only) turn. */
+  function classifyReadOnlyPermission(permission: PermissionInfo): { allow: boolean; reason: string } {
+    if (permission.kind === "bash") {
+      const command = typeof permission.metadata.command === "string" ? permission.metadata.command : undefined
+      if (command && isReadOnlyBashCommand(command)) return { allow: true, reason: "read-only command" }
+      return { allow: false, reason: "command is not recognisably read-only" }
+    }
+    if (READ_ONLY_PERMISSION_KINDS.has(permission.kind)) {
+      return { allow: true, reason: "read-only permission kind" }
+    }
+    return { allow: false, reason: `unsupported permission kind (${permission.kind})` }
+  }
+
+  /**
+   * True when the session's current turn was started from a Slack thread
+   * reply, or when it descends from such a session — subagents spawned by a
+   * Slack-originated turn inherit the read-only constraint.
+   */
+  function isReadOnlySession(sessionID: string): boolean {
+    let current: string | undefined = sessionID
+    while (current) {
+      if (mirroring.has(current)) return true
+      current = sessions.get(current)?.parentID
+    }
+    return false
+  }
+
+  /**
+   * Answers a permission request for a Slack-originated (read-only) turn
+   * without posting a card: clearly read-only bash commands and read-only
+   * permission kinds are approved once, everything else is rejected so the
+   * agent adapts and reports instead of mutating the workspace. Denials are
+   * announced in the session's thread.
+   */
+  async function autoRespondPermission(
+    permission: PermissionInfo,
+    allow: boolean,
+    reason: string,
+  ): Promise<void> {
+    if (!permission.id || !permission.sessionID) return
+    let submitted = false
+    try {
+      const result = await client.postSessionIdPermissionsPermissionId({
+        path: { id: permission.sessionID, permissionID: permission.id },
+        body: { response: allow ? "once" : "reject" },
+      })
+      submitted = !result.error
+      if (result.error) {
+        await log("warn", "read-only auto-response failed", {
+          permissionID: permission.id,
+          status: result.response.status,
+          error: describeError(result.error),
+        })
+      }
+    } catch (error) {
+      await log("warn", "read-only auto-response failed", {
+        permissionID: permission.id,
+        error: describeError(error),
+      })
+    }
+    if (!submitted) return
+    await log(allow ? "info" : "warn", allow ? "read-only turn: auto-approved" : "read-only turn: denied", {
+      permissionID: permission.id,
+      sessionID: permission.sessionID,
+      kind: permission.kind,
+      reason,
+    })
+    if (allow) return
+    const ref = sessions.get(permission.sessionID)
+    if (ref) {
+      await postThread(
+        ref,
+        `✋ _Read-only from Slack — denied: ${escapeMrkdwn(truncate(redactSecrets(permission.title), 120))}_`,
+      )
+    }
   }
 
   /** Extract a readable message from whatever shape a submit error came in. */
@@ -722,9 +805,22 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
         // Plan updates are routine progress and are not mirrored to Slack.
         return
       }
-      case "permission.asked":
+      case "permission.asked": {
+        const permission = normalizePermission(event.properties)
+        if (config.readOnlyTurns && isReadOnlySession(permission.sessionID)) {
+          const verdict = classifyReadOnlyPermission(permission)
+          await autoRespondPermission(permission, verdict.allow, verdict.reason)
+          return
+        }
+        await onPermission(permission)
+        return
+      }
       case "permission.updated": {
-        await onPermission(normalizePermission(event.properties))
+        const permission = normalizePermission(event.properties)
+        // Read-only turns decide on `permission.asked` and never hold a
+        // card, so the update pass has nothing to render.
+        if (config.readOnlyTurns && isReadOnlySession(permission.sessionID)) return
+        await onPermission(permission)
         return
       }
       case "permission.replied": {
@@ -1090,7 +1186,7 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
 
     if (!targetID || !ref) {
       const hint = query
-        ? `No session matching \`${escapeMrkdwn(truncate(redactHostInfo(query), 60))}\` found.`
+        ? `No session matching \`${escapeMrkdwn(truncate(redactSecrets(query), 60))}\` found.`
         : "No sessions in this channel yet."
       await replyEphemeral(channelID, userID, hint)
       return
