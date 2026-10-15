@@ -240,7 +240,7 @@ export function permissionBlocks(
     elements: [
       {
         type: "mrkdwn",
-        text: "You can also reply in this thread to send a prompt, or send `!abort` to stop the session.",
+        text: "You can also reply in this thread to ask the agent — its reply lands here — or send `!abort` to stop the session.",
       },
     ],
   })
@@ -252,6 +252,31 @@ export function resolvedBlocks(label: string): SlackBlock[] {
     {
       type: "section",
       text: { type: "mrkdwn", text: escapeMrkdwn(label) },
+    },
+  ]
+}
+
+/** Upper bound for a mirrored agent reply; Slack section text allows 3000 chars. */
+const MIRROR_MAX_CHARS = 2900
+
+/** Short notification text for a mirrored agent reply. */
+export function agentReplyText(text: string): string {
+  return truncate(redactHostInfo((text ?? "").trim()), 120)
+}
+
+/**
+ * Slack blocks for the agent's answer to a Slack-originated prompt: the
+ * reply text, redacted and escaped like every card, truncated to Slack's
+ * section limit with an explicit `(truncated)` marker.
+ */
+export function agentReplyBlocks(text: string): SlackBlock[] {
+  const raw = (text ?? "").trim()
+  const body = truncate(redactHostInfo(raw), MIRROR_MAX_CHARS)
+  const suffix = raw.length > body.length ? "\n\n_(truncated)_" : ""
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `${escapeMrkdwn(body)}${suffix}` },
     },
   ]
 }

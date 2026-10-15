@@ -12,7 +12,9 @@ import type { Plugin } from "@opencode-ai/plugin";
  * - Handles the /s slash command: an ephemeral reply with the session's
  *   last few activity lines, pending approval/question state, all redacted.
  * - Lets you answer approvals and questions with buttons and inject thread
- *   replies back into the running session as prompts.
+ *   replies back into the running session as prompts. The agent's reply to a
+ *   Slack-originated prompt is mirrored back into the thread (set
+ *   SLACK_REPLY_MIRROR=off to disable).
  * - Routine progress (tool runs, plans, completion summaries, errors) is not
  *   mirrored, and host-specific detail (absolute paths, hostnames, usernames)
  *   is redacted from everything posted.

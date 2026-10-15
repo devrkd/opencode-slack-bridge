@@ -6,6 +6,8 @@ import type { Session } from "@opencode-ai/sdk"
 import { loadConfig } from "./config"
 import { SessionMap, type SessionRef } from "./session-map"
 import {
+  agentReplyBlocks,
+  agentReplyText,
   childSessionRootText,
   childThreadPointerText,
   escapeMrkdwn,
@@ -24,6 +26,7 @@ import {
   type PermissionAction,
   type PermissionInfo,
   type QuestionRequestInfo,
+  type SlackBlock,
   type StatusActivity,
 } from "./format"
 
@@ -77,6 +80,17 @@ type PendingQuestion = {
   selected: string[][]
 }
 
+/**
+ * In-flight reply mirroring for a session whose turn was started from a
+ * Slack thread reply: tracks which text parts were already posted so
+ * streaming re-emits are not duplicated, and whether anything was posted
+ * at all (drives the session.idle fallback).
+ */
+type MirrorState = {
+  postedParts: Set<string>
+  postedAny: boolean
+}
+
 export async function createBridge(input: PluginInput): Promise<Bridge | null> {
   const result = loadConfig(input.directory)
 
@@ -106,6 +120,8 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
   const threadLocks = new Map<string, Promise<SessionRef | null>>()
   const pendingPermissions = new Map<string, PendingPermission>()
   const pendingQuestions = new Map<string, PendingQuestion>()
+  /** sessionID -> in-flight reply mirroring; present while the turn started from Slack is running. */
+  const mirroring = new Map<string, MirrorState>()
   /** sessionID -> reaction currently on its root message (in-memory only); absence means none. */
   const statusReactions = new Map<string, ReactionState>()
   const serverUrl = input.serverUrl
@@ -196,6 +212,19 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
     }
   }
 
+  async function postThreadBlocks(ref: SessionRef, text: string, blocks: SlackBlock[]): Promise<void> {
+    try {
+      await web.chat.postMessage({
+        channel: ref.channel,
+        thread_ts: ref.ts,
+        text,
+        blocks,
+      })
+    } catch {
+      // best-effort
+    }
+  }
+
   /**
    * True when a reactions.add/remove error simply means the desired state
    * already holds (e.g. Slack's `already_reacted` / `no_reaction`) or the
@@ -273,6 +302,69 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
       // ignore
     }
     return ""
+  }
+
+  /** Role of one session message, resolved from the messages API. */
+  async function messageRole(sessionID: string, messageID: string): Promise<string | undefined> {
+    try {
+      const res = await client.session.messages({ path: { id: sessionID } })
+      return (res.data ?? []).find((message) => message.info.id === messageID)?.info.role
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Mirrors one completed assistant text part into the session's Slack
+   * thread. Only active while the turn was started from a Slack reply
+   * (`mirroring` map); synthetic/ignored parts and user messages are
+   * skipped, and per-part dedupe guards against repeated streaming
+   * emissions. Best-effort: failures just leave the part unmirrored.
+   */
+  async function onPartUpdated(part: unknown): Promise<void> {
+    if (!part || typeof part !== "object") return
+    const p = part as {
+      type?: string
+      sessionID?: string
+      messageID?: string
+      id?: string
+      text?: string
+      synthetic?: boolean
+      ignored?: boolean
+      time?: { end?: number }
+    }
+    if (p.type !== "text" || !p.sessionID || !p.id || !p.messageID) return
+    if (p.synthetic || p.ignored) return
+    if (!p.time?.end) return
+    const state = mirroring.get(p.sessionID)
+    if (!state || state.postedParts.has(p.id)) return
+    const text = (p.text ?? "").trim()
+    if (!text) return
+    if ((await messageRole(p.sessionID, p.messageID)) !== "assistant") return
+    const ref = sessions.get(p.sessionID)
+    if (!ref) return
+    state.postedParts.add(p.id)
+    state.postedAny = true
+    await postThreadBlocks(ref, agentReplyText(text), agentReplyBlocks(text))
+    await log("info", "agent reply mirrored to Slack", { sessionID: p.sessionID, messageID: p.messageID })
+  }
+
+  /**
+   * Ends reply mirroring for a session. If the part events produced nothing
+   * postable (shape drift, empty parts), the turn's final assistant text is
+   * fetched and posted as a fallback so the answer still lands in the thread.
+   */
+  async function flushMirrorOnIdle(sessionID: string): Promise<void> {
+    const state = mirroring.get(sessionID)
+    if (!state) return
+    mirroring.delete(sessionID)
+    if (state.postedAny) return
+    const ref = sessions.get(sessionID)
+    if (!ref) return
+    const text = await lastAssistantText(sessionID)
+    if (!text) return
+    await postThreadBlocks(ref, agentReplyText(text), agentReplyBlocks(text))
+    await log("info", "agent reply mirrored to Slack (idle fallback)", { sessionID })
   }
 
   function permissionValue(permission: PermissionInfo, action: PermissionAction): string {
@@ -603,12 +695,15 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
       }
       case "session.idle": {
         // Routine progress is intentionally not mirrored to Slack; the only
-        // proactive posts are approval and question cards. The session is
-        // done, so replace the loader reaction with a done check mark.
+        // proactive posts are approval and question cards — plus the agent's
+        // reply when the turn was started from a Slack thread reply. The
+        // session is done, so replace the loader reaction with a done check
+        // mark and close out any pending reply mirroring.
         const { sessionID } = event.properties as { sessionID?: string }
         if (sessionID) {
           const ref = sessions.get(sessionID)
           if (ref) await setStatusReaction(sessionID, ref, "done")
+          await flushMirrorOnIdle(sessionID)
         }
         return
       }
@@ -659,6 +754,11 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
         )
         return
       }
+      case "message.part.updated": {
+        const { part } = event.properties as { part?: unknown }
+        await onPartUpdated(part)
+        return
+      }
       case "session.deleted": {
         const info = event.properties as { info?: { id?: string } }
         const sessionID = info.info?.id
@@ -666,6 +766,7 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
         const ref = sessions.get(sessionID)
         childSessions.delete(sessionID)
         sessions.delete(sessionID)
+        mirroring.delete(sessionID)
         // The session is over: swap the loader for the done check mark on
         // the root message, then drop the in-memory reaction state — no
         // further events can target this session, so nothing will retry it.
@@ -866,6 +967,7 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
       text?: string
       ts?: string
       thread_ts?: string
+      channel?: string
     }
   }): Promise<void> {
     const event = body.event
@@ -928,9 +1030,19 @@ export async function createBridge(input: PluginInput): Promise<Bridge | null> {
         body: { parts: [{ type: "text", text }] },
       })
       await markActive(sessionID)
-      await log("info", "injected Slack reply", { sessionID })
+      if (config.mirrorReplies && sessions.has(sessionID)) {
+        mirroring.set(sessionID, { postedParts: new Set(), postedAny: false })
+      }
+      await log("info", "injected Slack reply", { sessionID, mirror: mirroring.has(sessionID) })
     } catch (error) {
       await log("error", "failed to inject Slack reply", { error: String(error) })
+      if (event.channel && event.user) {
+        await replyEphemeral(
+          event.channel,
+          event.user,
+          "Could not reach the session — it may have ended. The message was not delivered.",
+        )
+      }
     }
   }
 

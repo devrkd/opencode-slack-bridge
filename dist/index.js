@@ -64,7 +64,10 @@ function loadConfig(directory) {
   if (problems.length > 0) {
     return { ok: false, reason: `missing or invalid ${problems.join(", ")}` };
   }
-  return { ok: true, config: { botToken, appToken, channel, allowedUsers } };
+  return {
+    ok: true,
+    config: { botToken, appToken, channel, allowedUsers, mirrorReplies: !isOff(process.env.SLACK_REPLY_MIRROR) }
+  };
 }
 
 // src/session-map.ts
@@ -270,7 +273,7 @@ ${escapeMrkdwn(truncate(redactHostInfo(context), 600))}` }
     elements: [
       {
         type: "mrkdwn",
-        text: "You can also reply in this thread to send a prompt, or send `!abort` to stop the session."
+        text: "You can also reply in this thread to ask the agent \u2014 its reply lands here \u2014 or send `!abort` to stop the session."
       }
     ]
   });
@@ -281,6 +284,21 @@ function resolvedBlocks(label) {
     {
       type: "section",
       text: { type: "mrkdwn", text: escapeMrkdwn(label) }
+    }
+  ];
+}
+var MIRROR_MAX_CHARS = 2900;
+function agentReplyText(text) {
+  return truncate(redactHostInfo((text ?? "").trim()), 120);
+}
+function agentReplyBlocks(text) {
+  const raw = (text ?? "").trim();
+  const body = truncate(redactHostInfo(raw), MIRROR_MAX_CHARS);
+  const suffix = raw.length > body.length ? "\n\n_(truncated)_" : "";
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `${escapeMrkdwn(body)}${suffix}` }
     }
   ];
 }
@@ -412,6 +430,7 @@ async function createBridge(input) {
   const threadLocks = /* @__PURE__ */ new Map();
   const pendingPermissions = /* @__PURE__ */ new Map();
   const pendingQuestions = /* @__PURE__ */ new Map();
+  const mirroring = /* @__PURE__ */ new Map();
   const statusReactions = /* @__PURE__ */ new Map();
   const serverUrl = input.serverUrl;
   if (config.allowedUsers.length === 0) {
@@ -489,6 +508,17 @@ async function createBridge(input) {
     } catch {
     }
   }
+  async function postThreadBlocks(ref, text, blocks) {
+    try {
+      await web.chat.postMessage({
+        channel: ref.channel,
+        thread_ts: ref.ts,
+        text,
+        blocks
+      });
+    } catch {
+    }
+  }
   function isReactionNoop(error, codes) {
     const dataError = error.data?.error;
     const message = describeError(error);
@@ -536,6 +566,44 @@ async function createBridge(input) {
     } catch {
     }
     return "";
+  }
+  async function messageRole(sessionID, messageID) {
+    try {
+      const res = await client.session.messages({ path: { id: sessionID } });
+      return (res.data ?? []).find((message) => message.info.id === messageID)?.info.role;
+    } catch {
+      return void 0;
+    }
+  }
+  async function onPartUpdated(part) {
+    if (!part || typeof part !== "object") return;
+    const p = part;
+    if (p.type !== "text" || !p.sessionID || !p.id || !p.messageID) return;
+    if (p.synthetic || p.ignored) return;
+    if (!p.time?.end) return;
+    const state = mirroring.get(p.sessionID);
+    if (!state || state.postedParts.has(p.id)) return;
+    const text = (p.text ?? "").trim();
+    if (!text) return;
+    if (await messageRole(p.sessionID, p.messageID) !== "assistant") return;
+    const ref = sessions.get(p.sessionID);
+    if (!ref) return;
+    state.postedParts.add(p.id);
+    state.postedAny = true;
+    await postThreadBlocks(ref, agentReplyText(text), agentReplyBlocks(text));
+    await log("info", "agent reply mirrored to Slack", { sessionID: p.sessionID, messageID: p.messageID });
+  }
+  async function flushMirrorOnIdle(sessionID) {
+    const state = mirroring.get(sessionID);
+    if (!state) return;
+    mirroring.delete(sessionID);
+    if (state.postedAny) return;
+    const ref = sessions.get(sessionID);
+    if (!ref) return;
+    const text = await lastAssistantText(sessionID);
+    if (!text) return;
+    await postThreadBlocks(ref, agentReplyText(text), agentReplyBlocks(text));
+    await log("info", "agent reply mirrored to Slack (idle fallback)", { sessionID });
   }
   function permissionValue(permission, action) {
     return JSON.stringify({
@@ -837,6 +905,7 @@ async function createBridge(input) {
         if (sessionID) {
           const ref = sessions.get(sessionID);
           if (ref) await setStatusReaction(sessionID, ref, "done");
+          await flushMirrorOnIdle(sessionID);
         }
         return;
       }
@@ -884,6 +953,11 @@ async function createBridge(input) {
         );
         return;
       }
+      case "message.part.updated": {
+        const { part } = event.properties;
+        await onPartUpdated(part);
+        return;
+      }
       case "session.deleted": {
         const info = event.properties;
         const sessionID = info.info?.id;
@@ -891,6 +965,7 @@ async function createBridge(input) {
         const ref = sessions.get(sessionID);
         childSessions.delete(sessionID);
         sessions.delete(sessionID);
+        mirroring.delete(sessionID);
         if (ref) await setStatusReaction(sessionID, ref, "done");
         statusReactions.delete(sessionID);
         await resolvePendingForSession(sessionID, "Session ended \u2014 pending request discarded.");
@@ -1090,9 +1165,19 @@ async function createBridge(input) {
         body: { parts: [{ type: "text", text }] }
       });
       await markActive(sessionID);
-      await log("info", "injected Slack reply", { sessionID });
+      if (config.mirrorReplies && sessions.has(sessionID)) {
+        mirroring.set(sessionID, { postedParts: /* @__PURE__ */ new Set(), postedAny: false });
+      }
+      await log("info", "injected Slack reply", { sessionID, mirror: mirroring.has(sessionID) });
     } catch (error) {
       await log("error", "failed to inject Slack reply", { error: String(error) });
+      if (event.channel && event.user) {
+        await replyEphemeral(
+          event.channel,
+          event.user,
+          "Could not reach the session \u2014 it may have ended. The message was not delivered."
+        );
+      }
     }
   }
   async function onSlashCommand(body) {

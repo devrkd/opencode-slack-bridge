@@ -6,6 +6,8 @@ export type BridgeConfig = {
   appToken: string
   channel: string
   allowedUsers: string[]
+  /** Mirror the agent's reply back into the thread for Slack-originated prompts. */
+  mirrorReplies: boolean
 }
 
 export type ConfigResult =
@@ -87,5 +89,8 @@ export function loadConfig(directory: string): ConfigResult {
     return { ok: false, reason: `missing or invalid ${problems.join(", ")}` }
   }
 
-  return { ok: true, config: { botToken, appToken, channel, allowedUsers } }
+  return {
+    ok: true,
+    config: { botToken, appToken, channel, allowedUsers, mirrorReplies: !isOff(process.env.SLACK_REPLY_MIRROR) },
+  }
 }

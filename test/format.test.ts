@@ -2,6 +2,8 @@ import { describe, it } from "node:test"
 import assert from "node:assert/strict"
 import { homedir } from "node:os"
 import {
+  agentReplyBlocks,
+  agentReplyText,
   childSessionRootText,
   childThreadPointerText,
   escapeMrkdwn,
@@ -307,5 +309,49 @@ describe("format: text helpers", () => {
     assert.ok(text.includes("working on it"))
     const empty = sessionStatusText("fix bug", { approval: false, question: false }, [])
     assert.ok(empty.includes("No recent activity"))
+  })
+})
+
+describe("format: agentReplyBlocks", () => {
+  it("wraps the reply in a single mrkdwn section", () => {
+    const blocks = agentReplyBlocks("All tests pass.")
+    assert.equal(blocks.length, 1)
+    const section = blocks[0] as { type: string; text: { type: string; text: string } }
+    assert.equal(section.type, "section")
+    assert.equal(section.text.type, "mrkdwn")
+    assert.equal(section.text.text, "All tests pass.")
+  })
+  it("redacts host paths from the reply", () => {
+    const blocks = agentReplyBlocks("failed to read /Users/ramesh/secret/key.txt")
+    const section = blocks[0] as { text: { text: string } }
+    assert.ok(section.text.text.includes("[path]"))
+    assert.ok(!section.text.text.includes("ramesh"))
+  })
+  it("escapes mrkdwn control characters", () => {
+    const blocks = agentReplyBlocks("a < b & c > d")
+    const section = blocks[0] as { text: { text: string } }
+    assert.equal(section.text.text, "a &lt; b &amp; c &gt; d")
+  })
+  it("marks oversized replies as truncated", () => {
+    const blocks = agentReplyBlocks("z".repeat(4000))
+    const section = blocks[0] as { text: { text: string } }
+    assert.ok(section.text.text.length <= 2920)
+    assert.ok(section.text.text.endsWith("_(truncated)_"))
+  })
+  it("handles blank input", () => {
+    const blocks = agentReplyBlocks("   ")
+    const section = blocks[0] as { text: { text: string } }
+    assert.equal(section.text.text, "")
+  })
+})
+
+describe("format: agentReplyText", () => {
+  it("returns a short redacted notification line", () => {
+    assert.equal(agentReplyText("done /Users/ramesh/x"), "done [path]")
+  })
+  it("truncates long replies", () => {
+    const out = agentReplyText("q".repeat(300))
+    assert.equal(out.length, 120)
+    assert.ok(out.endsWith("…"))
   })
 })
