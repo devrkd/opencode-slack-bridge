@@ -2,8 +2,8 @@
 
 The [`opencode-slack-bridge`](https://www.npmjs.com/package/opencode-slack-bridge) npm package is an opencode **plugin** that bridges opencode sessions to Slack and lets you steer long agent runs from Slack — approving prompts, answering the agent's questions, and injecting replies without touching the terminal.
 
-- **Out** — one Slack thread per session in the configured channel, used **only** for approval and question cards, each with a compact, redacted context summary. Routine progress (tool runs, plans, completion summaries, errors) is not mirrored, and host-specific detail (absolute paths, hostnames, usernames) is redacted from everything posted. Subagent (child) sessions get a thread **lazily**, only when they need approval or input (see below). A loader reaction (`:hourglass_flowing_sand:`) on the thread's root message marks work in progress; when the session ends it is swapped for a done check mark (`:white_check_mark:`) — see [Reaction lifecycle](#reaction-lifecycle).
-- **In** — interactive approval messages with **Approve once / Always / Reject** buttons, option buttons for the agent's `question` tool, thread replies injected into the running session as prompts (with the agent's reply mirrored back into the thread), and `!abort` to stop a session.
+- **Out** — one Slack thread per session in the configured channel, used **only** for approval and question cards, each with a compact context summary. Routine progress (tool runs, plans, completion summaries, errors) is not mirrored. Credentials are redacted from everything posted — token prefixes (Slack, GitHub, OpenAI/Anthropic, AWS), JWTs, private-key blocks, Authorization headers, credentials in URLs, and `KEY=value` pairs with sensitive keys — while paths and host detail stay readable so you can follow the work. Subagent (child) sessions get a thread **lazily**, only when they need approval or input (see below). A loader reaction (`:hourglass_flowing_sand:`) on the thread's root message marks work in progress; when the session ends it is swapped for a done check mark (`:white_check_mark:`) — see [Reaction lifecycle](#reaction-lifecycle).
+- **In** — interactive approval messages with **Approve once / Always / Reject** buttons, option buttons for the agent's `question` tool, thread replies injected into the running session as prompts (with the agent's reply mirrored back into the thread and the turn constrained to **read-only** execution), and `!abort` to stop a session.
 
 The plugin auto-loads when opencode starts. If the Slack config is incomplete it logs once and stays inert, so opencode always starts.
 
@@ -14,7 +14,7 @@ The plugin auto-loads when opencode starts. If the Slack config is incomplete it
 | [`src/plugin.ts`](https://github.com/devrkd/opencode-slack-bridge/blob/main/src/plugin.ts) | Plugin entry point. Registers the `event` and `dispose` hooks and delegates to the bridge. |
 | [`src/config.ts`](https://github.com/devrkd/opencode-slack-bridge/blob/main/src/config.ts) | Reads the project `.env`, validates the Slack variables, honours `SLACK_BRIDGE=off`. |
 | [`src/bridge.ts`](https://github.com/devrkd/opencode-slack-bridge/blob/main/src/bridge.ts) | Core logic: event handling, lazy child-thread creation, Slack client wiring (Web API + Socket Mode), button actions, reply injection, stale-click and orphan-card handling. |
-| [`src/format.ts`](https://github.com/devrkd/opencode-slack-bridge/blob/main/src/format.ts) | Block Kit formatting, mrkdwn escaping/truncation, normalisation of permission/question events, and host-info redaction (`redactHostInfo`). |
+| [`src/format.ts`](https://github.com/devrkd/opencode-slack-bridge/blob/main/src/format.ts) | Block Kit formatting, mrkdwn escaping/truncation, normalisation of permission/question events, and credential redaction (`redactSecrets`). |
 | [`src/session-map.ts`](https://github.com/devrkd/opencode-slack-bridge/blob/main/src/session-map.ts) | Persists the `sessionID → Slack thread` mapping. |
 | [`package.json`](https://github.com/devrkd/opencode-slack-bridge/blob/main/package.json) | Runtime deps: `@slack/web-api`, `@slack/socket-mode`. Dev deps: `@slack/types`, `@opencode-ai/plugin`, `@opencode-ai/sdk`. |
 | `.opencode/slack-bridge-state.json` | Runtime state file (session→thread map), written under the host project's `.opencode/` and not committed; a corrupt file is discarded and the bridge starts clean. |
@@ -33,6 +33,7 @@ The plugin reads the project `.env` **itself** (`loadDotenv` in `src/config.ts`)
 | `SLACK_ALLOWED_USERS` | recommended | Comma-separated Slack user IDs allowed to answer approvals. If empty, **any** member of the channel can approve agent commands (a warning is logged). |
 | `SLACK_BRIDGE` | no | Set to `off` to disable the bridge without removing tokens (`off`/`false`/`0`/`no` all disable). |
 | `SLACK_REPLY_MIRROR` | no | Set to `off` to stop mirroring the agent's reply back into the thread for Slack-originated prompts (`off`/`false`/`0`/`no` all disable; default on). |
+| `SLACK_READ_ONLY` | no | Set to `off` to disable read-only enforcement for Slack-originated turns and fall back to approval cards for every permission (`off`/`false`/`0`/`no` all disable; default on). |
 
 On startup the bridge:
 
@@ -56,8 +57,8 @@ Child (subagent) sessions behave differently — see below.
 | `tool.execute.after` | No Slack message (routine progress is not mirrored). |
 | `session.idle` | No Slack message (completion summaries are not mirrored); swaps the loader reaction for the `:white_check_mark:` done reaction. If the turn was started from a Slack reply and nothing was mirrored yet, the agent's final text is posted as a fallback. |
 | `session.error` | No Slack message; the error is logged locally under `slack-bridge`. |
-| `message.part.updated` | Only while the turn was started from a Slack reply: each completed assistant text part is posted into the thread, redacted and truncated (see [Ask the agent from the thread](#inbound-steering-from-slack)). |
-| `permission.asked` / `permission.updated` | Posts an **approval card** (see below). For a child, this creates the child's thread on demand and drops a pointer notice in the parent's thread. |
+| `message.part.updated` | Only while the turn was started from a Slack reply: each completed assistant text part is posted into the thread, secret-redacted and truncated (see [Ask the agent from the thread](#inbound-steering-from-slack)). |
+| `permission.asked` / `permission.updated` | Posts an **approval card** (see below) — unless the turn is read-only (started from a Slack reply with `SLACK_READ_ONLY` on): then the request is answered automatically without a card (read-only commands/kinds approved once, everything else rejected and announced in the thread). For a child, this creates the child's thread on demand and drops a pointer notice in the parent's thread. |
 | `permission.replied` | Updates the card to *"Approval resolved in terminal: `<reply>`"*. |
 | `question.asked` / `question.v2.asked` | Posts a **question card** (see below). For a child, this creates the child's thread on demand and drops a pointer notice in the parent's thread. |
 | `question.replied` / `question.rejected` (and v2) | Updates the card to *"Answered/Rejected elsewhere (terminal)"*. |
@@ -85,7 +86,7 @@ Sessions with a `parentID` — e.g. an Architect or Developer spawned via the Or
 
 ### Approval cards
 
-For each `permission.asked`, the bridge posts an interactive message with the permission kind, the redacted command/always patterns (raw `filePath`/`file`/`path`/`url`/`query` metadata is **never** forwarded), a compact summary of the last few lines of session context (redacted), and three buttons:
+For each `permission.asked`, the bridge posts an interactive message with the permission kind, the command/always patterns (credential-redacted), a compact summary of the last few lines of session context (credential-redacted), and three buttons:
 
 - **Approve once** → submits `once` for that permission
 - **Always** → submits `always`
@@ -97,7 +98,7 @@ Stale or replayed clicks are discarded: a click is only honoured if the bridge s
 
 ### Question cards
 
-For each `question.asked`, the bridge renders the agent's `question` tool as buttons: one button per option (multi-select toggles), **Submit answers**, and **Reject**. The card also carries a compact, redacted summary of the last few lines of session context. Single-select questions auto-submit once every question has an answer; multi-select needs an explicit Submit. Thread replies can also fill in the first unanswered question (including custom answers when the question allows them). Submission posts to the opencode server's `/question/<id>/reply` endpoint; rejection posts to `/question/<id>/reject`. Option buttons carry only the question/option indexes — the bridge resolves the chosen option from its own pending state — and stale clicks on a request that is no longer pending are ignored.
+For each `question.asked`, the bridge renders the agent's `question` tool as buttons: one button per option (multi-select toggles), **Submit answers**, and **Reject**. The card also carries a compact, credential-redacted summary of the last few lines of session context. Single-select questions auto-submit once every question has an answer; multi-select needs an explicit Submit. Thread replies can also fill in the first unanswered question (including custom answers when the question allows them). Submission posts to the opencode server's `/question/<id>/reply` endpoint; rejection posts to `/question/<id>/reject`. Option buttons carry only the question/option indexes — the bridge resolves the chosen option from its own pending state — and stale clicks on a request that is no longer pending are ignored.
 
 ## Inbound: steering from Slack
 
@@ -107,7 +108,17 @@ Socket Mode delivers `block_actions` (button clicks) and `event_callback` (messa
 2. Checks the sender against `SLACK_ALLOWED_USERS`; unauthorized users are ignored (and a warning is logged).
 3. `!abort` (or `abort`) → aborts the session via opencode's abort API.
 4. Otherwise, if a question is pending for the session, the reply answers the first unanswered question (auto-submitting a fully-answered single-select question).
-5. Otherwise the reply is **injected into the running session as a prompt** via `promptAsync` — it behaves exactly like a typed prompt in the terminal — and the session is marked for **reply mirroring**: every assistant text message the agent produces for that turn is posted back into the thread (redacted, escaped, and truncated like every other post; over-long replies end with an explicit _(truncated)_ marker). If the injected prompt cannot be delivered (e.g. the session has ended), an ephemeral error is shown to the sender. Mirroring stops when the turn ends (`session.idle`), and `SLACK_REPLY_MIRROR=off` disables it entirely.
+5. Otherwise the reply is **injected into the running session as a prompt** via `promptAsync` — it behaves exactly like a typed prompt in the terminal — and the session is marked for **reply mirroring**: every assistant text message the agent produces for that turn is posted back into the thread (escaped, and truncated like every other post; over-long replies end with an explicit _(truncated)_ marker). If the injected prompt cannot be delivered (e.g. the session has ended), an ephemeral error is shown to the sender. Mirroring stops when the turn ends (`session.idle`), and `SLACK_REPLY_MIRROR=off` disables it entirely.
+
+### Read-only turns
+
+A turn started from a Slack thread reply runs **read-only** by default (`SLACK_READ_ONLY=off` restores card-based approvals for everything):
+
+- **Read-only permission kinds** (`read`, `glob`, `grep`, `list`, `task`, `webfetch`) are approved automatically.
+- **Bash commands** are classified by a conservative allowlist (file reading, text search, `git` read subcommands, etc.). Recognised read-only commands — including every segment of a pipe or `&&` chain — are approved automatically; commands with redirection, command substitution, backgrounding, unrecognised programs, or anything that can mutate or reach the network are **rejected**.
+- **Everything else** — `edit`, file writes, unknown permission kinds — is rejected.
+- Rejections are announced in the session's thread (`✋ Read-only from Slack — denied: …`) and returned to the agent, which adapts and reports instead of mutating the workspace. Subagent sessions spawned by a read-only turn inherit the constraint.
+- Approval cards are not posted for permission requests inside read-only turns; `permission.asked` for them is answered automatically.
 
 ## Setup
 
@@ -153,9 +164,9 @@ The bridge runs **inside the opencode server**, so anything Slack injects shows 
 
 - **Child (subagent) threads are lazy.** Sessions with a `parentID` get no thread until they first ask for approval or input; from then on their approval and question cards post to their own thread, reachable via the pointer notice in the parent's thread.
 - **Progress is never mirrored — with one exception.** Tool runs, plan updates, completion summaries, and errors produce no Slack messages; errors are logged locally only. The channel only receives approval/question cards, their context summaries, and (since reply mirroring) the agent's reply to a prompt that was typed in a session's thread.
-- **Reply mirroring is scoped to Slack-originated prompts.** Only turns started by a thread reply mirror their assistant text back; work started in the terminal stays invisible in Slack. Mirrored replies are redacted (paths, hostnames) and truncated to Slack's message limits. `/s` still answers without waking the agent when all you need is the recent activity.
-- **Status reactions, never messages.** Each thread's root message carries a loader (`:hourglass_flowing_sand:`) while the session is busy, swapped for a done check mark (`:white_check_mark:`) when it idles or is deleted; new activity (a new card, a question answered from Slack, or a Slack reply injected as a prompt) swaps it back. Reactions need the `reactions:write` bot scope and are tracked in memory only — after a plugin reload the state starts clean and the next activity signal re-applies the loader, so a stale reaction can linger on an idle thread until the session is touched again.
-- **Host detail is redacted.** Absolute paths, Windows drive/UNC paths, and raw `filePath`/`file`/`path`/`url`/`query` permission metadata never reach Slack; the working directory is reduced to its project basename, and the recent-context summaries are redacted before posting.
+- **Reply mirroring is scoped to Slack-originated prompts.** Only turns started by a thread reply mirror their assistant text back; work started in the terminal stays invisible in Slack. Mirrored replies are secret-redacted and truncated to Slack's message limits. `/s` still answers without waking the agent when all you need is the recent activity.
+- **Slack turns are read-only by default.** Prompts injected from a thread cannot modify the workspace: read-only commands run automatically, everything else is denied with a note in the thread. The bash allowlist is deliberately narrow (no `npm`/`node`/`curl`/`awk`/`sed`/`git` mutations) — deny is the default, and `SLACK_READ_ONLY=off` restores card-based approvals if you want full interactivity from Slack.
+- **Credentials are redacted, not paths.** Token prefixes (Slack, GitHub, OpenAI/Anthropic, AWS), JWTs, private-key blocks, Authorization headers, credentials in URLs, and `KEY=value` pairs with sensitive keys are replaced with `[redacted]` before posting. Absolute paths, hostnames, and other host detail are **not** redacted — agent output stays readable, so review what the agent prints before steering it from a shared channel.
 - **Stale clicks are discarded.** Approval and question buttons are only honoured while the bridge still holds the corresponding pending request; clicks on resolved or replayed cards are ignored. A failed approval submit keeps the card live on transient errors and discards it (*"Session no longer active — approval discarded."*) when opencode definitively rejects it.
 - **Orphan sweep on `session.deleted`.** When a session is deleted, the bridge removes its thread mapping, leaves the `:white_check_mark:` done reaction on the root message, and resolves every pending approval/question card still registered for it — the Slack cards are updated to *"Session ended — pending request discarded."* and the pending entries are dropped so stale state can never resolve a different session.
 - All Slack posts are best-effort; a failed post is silent. To diagnose, run `opencode serve --print-logs --log-level DEBUG` and look for `slack-bridge` service lines: `Slack bridge connected`, `created Slack thread`, `approval card posted`, `child approval card posted`, `question card posted`, `session error (not posted to Slack)`, `injected Slack reply`, `disabled: …`, `Socket Mode connection failed`, `ignored approval from unauthorized user …`, `ignored stale approval`, `ignored stale question action`, `orphaned card resolved`.

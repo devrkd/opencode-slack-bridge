@@ -15,7 +15,7 @@ import {
   questionBlocks,
   questionText,
   recentContextLines,
-  redactHostInfo,
+  redactSecrets,
   resolvedBlocks,
   sessionRootText,
   sessionStatusText,
@@ -48,24 +48,50 @@ describe("format: truncate", () => {
   })
 })
 
-describe("format: redactHostInfo (security)", () => {
-  it("redacts absolute unix paths", () => {
-    assert.equal(redactHostInfo("cannot read /Users/ramesh/secret/key.txt"), "cannot read [path]")
-    assert.equal(redactHostInfo("see /home/dev/build.log for detail"), "see [path] for detail")
-    assert.equal(redactHostInfo("cached in /var/folders/ps/x/y/T"), "cached in [path]")
+describe("format: redactSecrets (security)", () => {
+  it("leaves absolute paths readable", () => {
+    assert.equal(
+      redactSecrets("cannot read /Users/ramesh/secret/key.txt"),
+      "cannot read /Users/ramesh/secret/key.txt",
+    )
+    assert.equal(redactSecrets("see /home/dev/build.log for detail"), "see /home/dev/build.log for detail")
+    assert.equal(redactSecrets("open C:\\Users\\dev\\file.txt now"), "open C:\\Users\\dev\\file.txt now")
   })
-  it("redacts windows drive and UNC paths", () => {
-    assert.equal(redactHostInfo("open C:\\Users\\dev\\file.txt now"), "open [path] now")
-    assert.equal(redactHostInfo("share \\\\FILESERVER\\projects\\x"), "share [path]")
+  it("redacts known token prefixes", () => {
+    assert.equal(redactSecrets("slack xoxb-1234-abcdef-ghijkl"), "slack [redacted]")
+    assert.equal(redactSecrets("gh repo ghp_0123456789abcdef0123456789abcdef"), "gh repo [redacted]")
+    assert.equal(redactSecrets("key sk-proj-0123456789abcdef012345"), "key [redacted]")
   })
-  it("never lets hostnames or usernames leak through the placeholder", () => {
-    const out = redactHostInfo("error at /Users/ramesh/secret: permission denied")
-    assert.ok(!out.includes("ramesh"))
-    assert.ok(out.includes("[path]"))
+  it("redacts AWS keys, JWTs and authorization headers", () => {
+    assert.equal(redactSecrets("aws AKIAIOSFODNN7EXAMPLE"), "aws [redacted]")
+    const jwt = redactSecrets(
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c",
+    )
+    assert.equal(jwt, "[redacted]")
+    const header = redactSecrets("Authorization: Bearer abc123def.ghi")
+    assert.ok(header.includes("[redacted]"))
+    assert.ok(!header.includes("abc123def"))
   })
-  it("leaves relative paths and plain text alone", () => {
-    assert.equal(redactHostInfo("edit src/foo.ts"), "edit src/foo.ts")
-    assert.equal(redactHostInfo("no paths here"), "no paths here")
+  it("redacts credentials inside URLs", () => {
+    assert.equal(
+      redactSecrets("postgres://admin:s3cret@db.local:5432/app"),
+      "postgres://[redacted]@db.local:5432/app",
+    )
+  })
+  it("redacts KEY=value pairs with sensitive keys", () => {
+    assert.equal(redactSecrets("password=hunter2"), "password=[redacted]")
+    assert.ok(redactSecrets('export API_KEY: "abc123"').includes("[redacted]"))
+    assert.ok(!redactSecrets('export API_KEY: "abc123"').includes("abc123"))
+    assert.equal(redactSecrets("token: abcdef12345"), "token: [redacted]")
+  })
+  it("redacts private key blocks", () => {
+    const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----"
+    assert.equal(redactSecrets(`cert: ${pem}`), "cert: [redacted private key]")
+  })
+  it("leaves ordinary text and code untouched", () => {
+    assert.equal(redactSecrets("edit src/foo.ts"), "edit src/foo.ts")
+    assert.equal(redactSecrets("const tokenCount = 5"), "const tokenCount = 5")
+    assert.equal(redactSecrets("npm install left-pad"), "npm install left-pad")
   })
 })
 
@@ -91,9 +117,8 @@ describe("format: recentContextLines", () => {
     assert.equal(recentContextLines("   \n  "), "")
   })
   it("redacts each line before truncation applies", () => {
-    const out = recentContextLines(`/Users/ramesh/secret/${"x".repeat(200)}`, 3, 20)
-    assert.ok(out.includes("[path]"))
-    assert.ok(!out.includes("ramesh"))
+    const out = recentContextLines(`token: ${"x".repeat(200)}`, 3, 20)
+    assert.ok(out.includes("[redacted]"))
   })
   it("truncates long plain lines with an ellipsis", () => {
     const out = recentContextLines("y".repeat(100), 3, 20)
@@ -162,7 +187,7 @@ describe("format: permissionBlocks", () => {
       elements: Array<{ text: string }>
     }
     const text = context.elements[0].text
-    assert.ok(text.includes("command: `run [path]`"))
+    assert.ok(text.includes("command: `run /Users/ramesh/tool`"))
     assert.ok(text.includes("always: `git *`"))
     assert.ok(text.includes("fix bug"))
   })
@@ -281,9 +306,9 @@ describe("format: text helpers", () => {
     assert.ok(text.startsWith("*Session started* — fix bug"))
     assert.ok(text.includes("_Project: repo_"))
   })
-  it("sessionRootText redacts host detail from the title", () => {
+  it("sessionRootText keeps paths in the title readable", () => {
     const text = sessionRootText("work on /Users/ramesh/secret", "/repo")
-    assert.ok(!text.includes("ramesh"))
+    assert.ok(text.includes("/Users/ramesh/secret"))
   })
   it("childSessionRootText and pointer mention the child and parent", () => {
     const child = childSessionRootText("sub task", "parent task")
@@ -321,11 +346,13 @@ describe("format: agentReplyBlocks", () => {
     assert.equal(section.text.type, "mrkdwn")
     assert.equal(section.text.text, "All tests pass.")
   })
-  it("redacts host paths from the reply", () => {
-    const blocks = agentReplyBlocks("failed to read /Users/ramesh/secret/key.txt")
+  it("keeps paths readable but redacts secrets from the reply", () => {
+    const blocks = agentReplyBlocks(
+      "failed to read /Users/ramesh/secret/key.txt — token: abcdef12345",
+    )
     const section = blocks[0] as { text: { text: string } }
-    assert.ok(section.text.text.includes("[path]"))
-    assert.ok(!section.text.text.includes("ramesh"))
+    assert.ok(section.text.text.includes("/Users/ramesh/secret/key.txt"))
+    assert.ok(section.text.text.includes("token: [redacted]"))
   })
   it("escapes mrkdwn control characters", () => {
     const blocks = agentReplyBlocks("a < b & c > d")
@@ -347,7 +374,7 @@ describe("format: agentReplyBlocks", () => {
 
 describe("format: agentReplyText", () => {
   it("returns a short redacted notification line", () => {
-    assert.equal(agentReplyText("done /Users/ramesh/x"), "done [path]")
+    assert.equal(agentReplyText("done /Users/ramesh/x"), "done /Users/ramesh/x")
   })
   it("truncates long replies", () => {
     const out = agentReplyText("q".repeat(300))
