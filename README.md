@@ -20,7 +20,7 @@ opencode installs the package and loads the ESM bundle (`dist/index.js`). The bu
 
 - **Approval cards** — permission prompts post to Slack as interactive messages with **Approve once / Always / Reject** buttons.
 - **Question cards** — the agent's `question` tool options render as buttons: single-select auto-submits when every question is answered; multi-select uses toggles plus **Submit answers**.
-- **Reply injection** — replying in a session's thread answers a pending question first if one exists; otherwise the reply is injected into the running session as a prompt. `!abort` (or `abort`) stops the session.
+- **Reply injection** — replying in a session's thread answers a pending question first if one exists; otherwise the reply is injected into the running session as a prompt and the agent's reply is posted back into the thread (set `SLACK_REPLY_MIRROR=off` to disable). `!abort` (or `abort`) stops the session.
 - **Status reactions** — the thread root message carries a loader (`:hourglass_flowing_sand:`) while the session works, swapped for a done check mark (`:white_check_mark:`) when it goes idle or is deleted; new activity swaps it back.
 - **`/s` status command** — `/s` replies ephemerally with the target session's title, pending approval/question state, and its last few activity lines, all redacted; `/s <text>` matches a session ID or title.
 - **Redaction** — host-specific detail never reaches Slack: paths, hostnames, usernames, and raw permission metadata are redacted or omitted from cards and summaries.
@@ -53,6 +53,7 @@ SLACK_ALLOWED_USERS=U0123ABCD,U0123ABCDE
 | `SLACK_CHANNEL` | yes | Channel ID where per-session threads are posted. |
 | `SLACK_ALLOWED_USERS` | recommended | Comma-separated Slack user IDs allowed to answer approvals and questions. If empty, any member of the channel can approve agent commands (a warning is logged). |
 | `SLACK_BRIDGE` | no | Set to `off` to disable the bridge without removing tokens (`off`/`false`/`0`/`no` all disable). |
+| `SLACK_REPLY_MIRROR` | no | Set to `off` to stop mirroring the agent's reply back into the thread for Slack-originated prompts (`off`/`false`/`0`/`no` all disable; default on). |
 
 The session→thread map is persisted in `.opencode/slack-bridge-state.json` under the project directory (not committed). A corrupt state file is discarded and the bridge starts clean.
 

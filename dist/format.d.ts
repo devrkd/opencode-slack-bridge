@@ -61,6 +61,14 @@ export declare function permissionText(permission: PermissionInfo): string;
 export type PermissionAction = "once" | "always" | "reject";
 export declare function permissionBlocks(permission: PermissionInfo, sessionTitle: string, actionPrefix: string, valueFor: (action: PermissionAction) => string, context?: string): SlackBlock[];
 export declare function resolvedBlocks(label: string): SlackBlock[];
+/** Short notification text for a mirrored agent reply. */
+export declare function agentReplyText(text: string): string;
+/**
+ * Slack blocks for the agent's answer to a Slack-originated prompt: the
+ * reply text, redacted and escaped like every card, truncated to Slack's
+ * section limit with an explicit `(truncated)` marker.
+ */
+export declare function agentReplyBlocks(text: string): SlackBlock[];
 /** Normalized view of an opencode `question.asked` event. */
 export type QuestionOption = {
     label: string;

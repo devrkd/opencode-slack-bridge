@@ -3,6 +3,8 @@ export type BridgeConfig = {
     appToken: string;
     channel: string;
     allowedUsers: string[];
+    /** Mirror the agent's reply back into the thread for Slack-originated prompts. */
+    mirrorReplies: boolean;
 };
 export type ConfigResult = {
     ok: true;

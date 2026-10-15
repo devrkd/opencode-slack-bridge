@@ -3,7 +3,7 @@
 The [`opencode-slack-bridge`](https://www.npmjs.com/package/opencode-slack-bridge) npm package is an opencode **plugin** that bridges opencode sessions to Slack and lets you steer long agent runs from Slack — approving prompts, answering the agent's questions, and injecting replies without touching the terminal.
 
 - **Out** — one Slack thread per session in the configured channel, used **only** for approval and question cards, each with a compact, redacted context summary. Routine progress (tool runs, plans, completion summaries, errors) is not mirrored, and host-specific detail (absolute paths, hostnames, usernames) is redacted from everything posted. Subagent (child) sessions get a thread **lazily**, only when they need approval or input (see below). A loader reaction (`:hourglass_flowing_sand:`) on the thread's root message marks work in progress; when the session ends it is swapped for a done check mark (`:white_check_mark:`) — see [Reaction lifecycle](#reaction-lifecycle).
-- **In** — interactive approval messages with **Approve once / Always / Reject** buttons, option buttons for the agent's `question` tool, thread replies injected into the running session as prompts, and `!abort` to stop a session.
+- **In** — interactive approval messages with **Approve once / Always / Reject** buttons, option buttons for the agent's `question` tool, thread replies injected into the running session as prompts (with the agent's reply mirrored back into the thread), and `!abort` to stop a session.
 
 The plugin auto-loads when opencode starts. If the Slack config is incomplete it logs once and stays inert, so opencode always starts.
 
@@ -32,6 +32,7 @@ The plugin reads the project `.env` **itself** (`loadDotenv` in `src/config.ts`)
 | `SLACK_CHANNEL` | yes | Channel ID (e.g. `C0123ABCD`) where per-session threads are posted. |
 | `SLACK_ALLOWED_USERS` | recommended | Comma-separated Slack user IDs allowed to answer approvals. If empty, **any** member of the channel can approve agent commands (a warning is logged). |
 | `SLACK_BRIDGE` | no | Set to `off` to disable the bridge without removing tokens (`off`/`false`/`0`/`no` all disable). |
+| `SLACK_REPLY_MIRROR` | no | Set to `off` to stop mirroring the agent's reply back into the thread for Slack-originated prompts (`off`/`false`/`0`/`no` all disable; default on). |
 
 On startup the bridge:
 
@@ -43,7 +44,7 @@ On startup the bridge:
 
 One Slack thread per **top-level** session, created as soon as the session starts. The thread root message is *"Session started — `<title>` / _Project: `<project name>`_"* — the working directory is reduced to its basename (the project/repo name), never the full path. The mapping is persisted in `.opencode/slack-bridge-state.json` so a plugin reload keeps posting into the same thread instead of spawning a duplicate.
 
-Routine progress is **not** mirrored: tool runs, plan updates, completion summaries, and errors never produce Slack messages (errors are logged to the local opencode app log only). The channel only receives approval and question cards — the moments a human actually needs to act. The only other activity on the threads is the status reaction on each root message, which marks the session busy or done without ever adding a message (see [Reaction lifecycle](#reaction-lifecycle)).
+Routine progress is **not** mirrored: tool runs, plan updates, completion summaries, and errors never produce Slack messages (errors are logged to the local opencode app log only). The channel receives approval and question cards — the moments a human actually needs to act — plus, for turns started from a thread reply, the agent's answer (see [Inbound](#inbound-steering-from-slack)). The only other activity on the threads is the status reaction on each root message, which marks the session busy or done without ever adding a message (see [Reaction lifecycle](#reaction-lifecycle)).
 
 Child (subagent) sessions behave differently — see below.
 
@@ -53,8 +54,9 @@ Child (subagent) sessions behave differently — see below.
 | `session.updated` | Refreshes the thread root text when a session is renamed (top-level and child threads alike). |
 | `todo.updated` | No Slack message (routine progress is not mirrored). |
 | `tool.execute.after` | No Slack message (routine progress is not mirrored). |
-| `session.idle` | No Slack message (completion summaries are not mirrored); swaps the loader reaction for the `:white_check_mark:` done reaction. |
+| `session.idle` | No Slack message (completion summaries are not mirrored); swaps the loader reaction for the `:white_check_mark:` done reaction. If the turn was started from a Slack reply and nothing was mirrored yet, the agent's final text is posted as a fallback. |
 | `session.error` | No Slack message; the error is logged locally under `slack-bridge`. |
+| `message.part.updated` | Only while the turn was started from a Slack reply: each completed assistant text part is posted into the thread, redacted and truncated (see [Ask the agent from the thread](#inbound-steering-from-slack)). |
 | `permission.asked` / `permission.updated` | Posts an **approval card** (see below). For a child, this creates the child's thread on demand and drops a pointer notice in the parent's thread. |
 | `permission.replied` | Updates the card to *"Approval resolved in terminal: `<reply>`"*. |
 | `question.asked` / `question.v2.asked` | Posts a **question card** (see below). For a child, this creates the child's thread on demand and drops a pointer notice in the parent's thread. |
@@ -105,7 +107,7 @@ Socket Mode delivers `block_actions` (button clicks) and `event_callback` (messa
 2. Checks the sender against `SLACK_ALLOWED_USERS`; unauthorized users are ignored (and a warning is logged).
 3. `!abort` (or `abort`) → aborts the session via opencode's abort API.
 4. Otherwise, if a question is pending for the session, the reply answers the first unanswered question (auto-submitting a fully-answered single-select question).
-5. Otherwise the reply is **injected into the running session as a prompt** via `promptAsync` — it behaves exactly like a typed prompt in the terminal.
+5. Otherwise the reply is **injected into the running session as a prompt** via `promptAsync` — it behaves exactly like a typed prompt in the terminal — and the session is marked for **reply mirroring**: every assistant text message the agent produces for that turn is posted back into the thread (redacted, escaped, and truncated like every other post; over-long replies end with an explicit _(truncated)_ marker). If the injected prompt cannot be delivered (e.g. the session has ended), an ephemeral error is shown to the sender. Mirroring stops when the turn ends (`session.idle`), and `SLACK_REPLY_MIRROR=off` disables it entirely.
 
 ## Setup
 
@@ -150,7 +152,8 @@ The bridge runs **inside the opencode server**, so anything Slack injects shows 
 ## Known behaviour and limitations
 
 - **Child (subagent) threads are lazy.** Sessions with a `parentID` get no thread until they first ask for approval or input; from then on their approval and question cards post to their own thread, reachable via the pointer notice in the parent's thread.
-- **Progress is never mirrored.** Tool runs, plan updates, completion summaries, and errors produce no Slack messages; errors are logged locally only. The channel only receives approval/question cards and their context summaries.
+- **Progress is never mirrored — with one exception.** Tool runs, plan updates, completion summaries, and errors produce no Slack messages; errors are logged locally only. The channel only receives approval/question cards, their context summaries, and (since reply mirroring) the agent's reply to a prompt that was typed in a session's thread.
+- **Reply mirroring is scoped to Slack-originated prompts.** Only turns started by a thread reply mirror their assistant text back; work started in the terminal stays invisible in Slack. Mirrored replies are redacted (paths, hostnames) and truncated to Slack's message limits. `/s` still answers without waking the agent when all you need is the recent activity.
 - **Status reactions, never messages.** Each thread's root message carries a loader (`:hourglass_flowing_sand:`) while the session is busy, swapped for a done check mark (`:white_check_mark:`) when it idles or is deleted; new activity (a new card, a question answered from Slack, or a Slack reply injected as a prompt) swaps it back. Reactions need the `reactions:write` bot scope and are tracked in memory only — after a plugin reload the state starts clean and the next activity signal re-applies the loader, so a stale reaction can linger on an idle thread until the session is touched again.
 - **Host detail is redacted.** Absolute paths, Windows drive/UNC paths, and raw `filePath`/`file`/`path`/`url`/`query` permission metadata never reach Slack; the working directory is reduced to its project basename, and the recent-context summaries are redacted before posting.
 - **Stale clicks are discarded.** Approval and question buttons are only honoured while the bridge still holds the corresponding pending request; clicks on resolved or replayed cards are ignored. A failed approval submit keeps the card live on transient errors and discards it (*"Session no longer active — approval discarded."*) when opencode definitively rejects it.
