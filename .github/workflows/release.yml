@@ -1,18 +1,26 @@
 name: release
 
-# Conventional-commit driven release: every push to main computes the next
-# semver from the commits since the last v* tag (feat -> minor, BREAKING
-# CHANGE / `!:` -> major, anything else -> patch), bumps package.json,
-# publishes to npm, and tags the release.
+# Conventional-commit driven release, PR-gated for the protected `main`
+# (ruleset `contributors` requires pull requests + verified signatures):
+#
+#   1. Push to main with unreleased conventional commits → the workflow bumps
+#      package.json on a `release/v*` branch, signs the commit with the GPG
+#      release key (secrets GPG_PRIVATE_KEY / GPG_PASSPHRASE, key email must
+#      be a verified email on the account so the commit shows "Verified"),
+#      opens a PR to main, and enables auto-merge. Approving the PR releases.
+#   2. The squash-merge lands the bump on main and re-triggers this workflow.
+#      The new version has no tag yet, so that run publishes to npm, tags the
+#      release, and exits — no new PR.
 #
 # Publishing uses npm trusted publishing (OIDC) — no long-lived NPM_TOKEN
 # secret. The package's trusted publisher on npmjs.com must name this exact
 # workflow file (release.yml) with `npm publish` allowed, and requires
 # id-token: write plus npm >= 11.5.1 (Node 24 ships it) below.
 #
-# Loop guard: the release commit itself (`chore(release): …`) touches the
-# package and re-triggers this workflow; it is excluded from the bump scan,
-# so the follow-up run finds nothing to release and exits.
+# package.json on main is the source of truth for "what should be released":
+# untagged version → publish it; tagged version + pending conventional
+# commits → open a release PR. The `chore(release)` prefix is still excluded
+# from the bump scan so a merged release commit never bumps a second time.
 
 on:
   push:
@@ -22,7 +30,8 @@ on:
 
 permissions:
   id-token: write # OIDC token for npm trusted publishing
-  contents: write # push the version-bump commit and the release tag
+  contents: write # release branch, version-bump commit and the release tag
+  pull-requests: write # open the release PR and enable auto-merge
 
 concurrency:
   group: release
@@ -43,11 +52,22 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false # never use caching in release builds
 
-      - name: Compute next version from conventional commits
+      - name: Decide what to release
         id: bump
         run: |
           set -euo pipefail
           CURRENT=$(node -p "require('./package.json').version")
+
+          # package.json on main carries a version with no tag yet — the
+          # release PR was merged; publish and tag this exact version.
+          if ! git rev-parse -q --verify "refs/tags/v$CURRENT" >/dev/null; then
+            echo "v$CURRENT is untagged — publishing as-is"
+            {
+              echo "mode=publish"
+              echo "version=$CURRENT"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if git describe --tags --match "v*" --abbrev=0 >/dev/null 2>&1; then
             RANGE="$(git describe --tags --match "v*" --abbrev=0)..HEAD"
@@ -59,7 +79,7 @@ jobs:
           COMMITS=$(git log --format=%s%n%b "$RANGE" | grep -v '^chore(release)' || true)
           if [ -z "$COMMITS" ]; then
             echo "No package commits since ${LAST_TAG:-the beginning} — nothing to release"
-            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "mode=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -76,51 +96,90 @@ jobs:
             console.log(map['$LEVEL'].join('.'));
           ")
 
-          echo "Bumping $CURRENT -> $NEXT ($LEVEL) based on:"
+          echo "Releasing $CURRENT -> $NEXT ($LEVEL) based on:"
           echo "$COMMITS" | grep -E '^[a-zA-Z]+(\([^)]*\))?!?:' | head -20
           {
-            echo "release=true"
+            echo "mode=pr"
             echo "version=$NEXT"
             echo "level=$LEVEL"
           } >> "$GITHUB_OUTPUT"
 
       - name: Skip — nothing to release
-        if: steps.bump.outputs.release != 'true'
+        if: steps.bump.outputs.mode == 'none'
         run: echo "No unreleased package changes — done"
 
-      - name: Bump version
-        if: steps.bump.outputs.release == 'true'
-        run: npm version "${{ steps.bump.outputs.version }}" --no-git-tag-version --allow-same-version
+      # Import the GPG release key and configure git to sign commits with it.
+      # The key's email must be a verified email on the GitHub account the
+      # key is attached to, otherwise the commit shows "Unverified" and the
+      # required_signatures rule blocks the PR.
+      - name: Import GPG release key
+        if: steps.bump.outputs.mode == 'pr'
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          git_user_signing_key: true
+          git_commit_gpgsign: true
 
-      - name: Commit and push the version bump
-        if: steps.bump.outputs.release == 'true'
+      - name: Bump version
+        if: steps.bump.outputs.mode == 'pr'
+        run: npm version "${{ steps.bump.outputs.version }}" --no-git-tag-version
+
+      - name: Commit the version bump on a release branch
+        if: steps.bump.outputs.mode == 'pr'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="release/v${{ steps.bump.outputs.version }}"
+          git checkout -b "$BRANCH"
           git add package.json package-lock.json
           git commit -m "chore(release): opencode-slack-bridge v${{ steps.bump.outputs.version }}"
-          git push origin HEAD:main
+          git push --force-with-lease origin "$BRANCH"
+
+      - name: Open the release PR and enable auto-merge
+        if: steps.bump.outputs.mode == 'pr'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          BRANCH="release/v$VERSION"
+          if [ "$(gh pr list --head "$BRANCH" --state open --json id --jq length)" -eq 0 ]; then
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(release): opencode-slack-bridge v$VERSION" \
+              --body "Automated release PR.
+
+          - Version: \`$VERSION\` (${{ steps.bump.outputs.level }})
+          - Commit is GPG-signed to satisfy the \`required_signatures\` rule.
+          - Approving merges via squash; the merge triggers the publish run."
+          else
+            echo "Release PR for $BRANCH already open — branch updated"
+          fi
+
+          # Needs "Allow auto-merge" enabled in repo settings; without it the
+          # PR simply waits for a manual merge after approval.
+          gh pr merge --auto --squash "$BRANCH" \
+            || echo "::warning::auto-merge unavailable — approve and merge $BRANCH manually"
 
       - name: Install dependencies
-        if: steps.bump.outputs.release == 'true'
+        if: steps.bump.outputs.mode == 'publish'
         run: npm ci
 
       - name: Build
-        if: steps.bump.outputs.release == 'true'
+        if: steps.bump.outputs.mode == 'publish'
         run: npm run build
 
       - name: Test
-        if: steps.bump.outputs.release == 'true'
+        if: steps.bump.outputs.mode == 'publish'
         run: npm test
 
       - name: Publish to npm
-        if: steps.bump.outputs.release == 'true'
+        if: steps.bump.outputs.mode == 'publish'
         # No NODE_AUTH_TOKEN: npm >= 11.5.1 detects the GitHub Actions OIDC
         # environment and exchanges the short-lived id-token automatically.
         run: npm publish --access public
 
       - name: Create and push tag
-        if: steps.bump.outputs.release == 'true'
+        if: steps.bump.outputs.mode == 'publish'
         run: |
           echo "releasing opencode-slack-bridge@${{ steps.bump.outputs.version }}"
           git tag -a "v${{ steps.bump.outputs.version }}" -m "opencode-slack-bridge v${{ steps.bump.outputs.version }}"
